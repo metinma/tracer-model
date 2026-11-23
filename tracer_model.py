@@ -17,8 +17,8 @@ WELL_PARAMS = {
 
 def main():
     # Load data
-    tracer_data = import_tracer_data("./Tracer Data")
-    coordinate_data = import_coordinates("./Coordinate Files")
+    tracer_data = import_tracer_data("./tracer_data")
+    coordinate_data = import_coordinates("./coordinates")
     well_distances = compute_well_distances(coordinate_data)
 
     plot_3d_spatial_data(coordinate_data)
