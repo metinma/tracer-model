@@ -1,4 +1,5 @@
 import csv
+import inspect
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -154,6 +155,15 @@ def sampling_weights(t_obs):
     return 1 / np.sqrt(dt / np.mean(dt))
 
 
+def _fm_to_model(t_b, dt_p, L):
+    """Bullivant fracture-matrix: fitted (t_b, t_p - t_b, L) -> (t_b, w, L).
+
+    Eq. 18 gives w = (2/3) t_b / (t_p - t_b). Fitting the peak delay
+    dt_p = t_p - t_b instead of w keeps t_p > t_b and bounds the peak time.
+    """
+    return t_b, (2 / 3) * t_b / dt_p, L
+
+
 def fit_analytical_models(t_obs, C_obs):
     """Fit every model plus a constant background C_bg to one well.
 
@@ -161,90 +171,116 @@ def fit_analytical_models(t_obs, C_obs):
     values (all are positive and span several orders of magnitude); C_bg is
     fitted linearly, between 0 and the median of the earliest 10% of
     readings, since the background cannot exceed what was measured before
-    the tracer arrived. Readings are weighted by their
-    sampling interval. Amplitude guesses are scaled so the initial curve
-    passes through the observed peak.
+    the tracer arrived. Readings are weighted by their sampling interval.
+
+    Each model is fitted from several starting points and the best fit is
+    kept, so the result does not depend on one initial guess. Amplitude
+    guesses are scaled so each initial curve passes through the observed peak.
     """
     t_peak, C_peak = robust_peak(t_obs, C_obs)
     t_max = np.max(t_obs)
     sigma = sampling_weights(t_obs)
+    weights = 1 / sigma**2
 
     # Background: capped at the early (pre-arrival) level of the readings
     n_early = max(5, len(C_obs) // 10)
     C_bg_max = min(np.median(C_obs[:n_early]), C_peak)
     C_bg0 = 0.5 * C_bg_max
 
-    # Shape-parameter guesses consistent with a peak at t_peak
-    t_m0 = 1.2 * t_peak
-    w_sf0 = 6 * t_m0 * t_peak / (t_m0**2 - t_peak**2)  # B&O Eq. 9
-    t_b0 = 0.5 * t_peak
-    w_fm0 = (2 / 3) * t_b0 / (t_peak - t_b0)  # B&O Eq. 18
-    beta0 = 6.0  # Houseworth peak at theta = beta/6 when gamma = 0
+    # Starting points, each consistent with a peak near t_peak
+    arrival_fracs = [0.05, 0.2, 0.4, 0.6, 0.8, 0.9]
+    sauty_starts = [[f * t_peak, pe] for f in (1.0, 1.5) for pe in (3.0, 10.0, 30.0)]
+    sf_starts = [
+        [f * t_peak, 6 * f / (f**2 - 1)]  # B&O Eq. 9 with t_m = f t_peak
+        for f in (1.05, 1.2, 1.5, 2.0)
+    ]
+    fm_starts = [[f * t_peak, (1 - f) * t_peak] for f in arrival_fracs]
+    hw_starts = [
+        [f * t_peak, 6 * (1 - f) / f, gamma]  # peak at theta = beta/6
+        for f in arrival_fracs for gamma in (1e-3, 0.1)
+    ]
 
-    # model name: (function, parameter names, shape p0, lower, upper)
-    # The last parameter is the amplitude; its p0 and bounds are set below.
+    # model name: (function, fitted parameter names, starting points,
+    #              lower, upper, map from fitted to model parameters)
+    # The last fitted parameter is the amplitude; its guess and bounds are
+    # set below from the observed peak.
     models_config = {
         "sauty_uniform": (
-            sauty_uniform, ["t_c", "Pe", "C_max"],
-            [t_peak, 10.0], [0.01, 0.01], [10 * t_max, 1e4],
+            sauty_uniform, ["t_c", "Pe", "C_max"], sauty_starts,
+            [0.01, 0.01], [10 * t_max, 1e4], None,
         ),
         "bullivant_single_fracture": (
-            bullivant_single_fracture, ["t_m", "w", "L"],
-            [t_m0, w_sf0], [0.01, 0.01], [10 * t_max, 1e4],
+            bullivant_single_fracture, ["t_m", "w", "L"], sf_starts,
+            [0.01, 0.01], [10 * t_max, 1e4], None,
         ),
         "bullivant_fracture_matrix": (
-            bullivant_fracture_matrix, ["t_b", "w", "L"],
-            [t_b0, w_fm0], [0.01, 1e-4], [t_max, 1e4],
+            bullivant_fracture_matrix, ["t_b", "dt_p", "L"], fm_starts,
+            [0.01, 0.01], [t_max, 2 * t_max], _fm_to_model,
         ),
         "houseworth_fracture_matrix": (
-            houseworth_fracture_matrix, ["t_a", "beta", "gamma", "M"],
-            [t_b0, beta0, 1e-3], [0.01, 1e-4, 1e-8], [t_max, 1e4, 1e4],
+            houseworth_fracture_matrix, ["t_a", "beta", "gamma", "M"], hw_starts,
+            [0.01, 1e-4, 1e-8], [t_max, 1e4, 1e4], None,
         ),
     }
 
     results = []
-    for name, (func, param_names, p0, lower, upper) in models_config.items():
-        # Amplitude guess: make the initial curve pass through the peak
-        shape_at_peak = func(np.array([t_peak]), *p0, 1.0)[0]
-        amp0 = (C_peak - C_bg0) / shape_at_peak if shape_at_peak > 0 else C_peak
-        p0 = p0 + [amp0]
-        lower = lower + [amp0 * 1e-8]
-        upper = upper + [amp0 * 1e8]
+    for name, (func, names, starts, lower, upper, to_model) in models_config.items():
+        to_model = to_model or (lambda *p: p)
 
-        # Fitted vector: log of each model parameter, then C_bg (linear)
-        def fit_func(t, *q, func=func):
-            return func(t, *np.exp(q[:-1])) + q[-1]
+        def fit_func(t, *q, func=func, to_model=to_model):
+            return func(t, *to_model(*np.exp(q[:-1]))) + q[-1]
 
-        q_lower = np.append(np.log(lower), 0.0)
-        q_upper = np.append(np.log(upper), C_bg_max)
-        q0 = np.clip(np.append(np.log(p0), C_bg0), q_lower + 1e-6, q_upper - 1e-6)
-        q_opt, _ = curve_fit(
-            fit_func, t_obs, C_obs, p0=q0, sigma=sigma,
-            bounds=(q_lower, q_upper), method="trf", maxfev=20000,
-        )
-        popt, C_bg = np.exp(q_opt[:-1]), q_opt[-1]
+        best = None
+        for shape0 in starts:
+            # Amplitude guess: make the initial curve pass through the peak
+            shape_at_peak = func(np.array([t_peak]), *to_model(*shape0, 1.0))[0]
+            amp0 = (C_peak - C_bg0) / shape_at_peak if shape_at_peak > 0 else C_peak
 
-        # Model parameters within 0.1% of a bound are not really estimated.
+            q_lower = np.append(np.log(lower + [amp0 * 1e-8]), 0.0)
+            q_upper = np.append(np.log(upper + [amp0 * 1e8]), C_bg_max)
+            q0 = np.append(np.log(shape0 + [amp0]), C_bg0)
+            q0 = np.clip(q0, q_lower + 1e-6, q_upper - 1e-6)
+            try:
+                q_opt, _ = curve_fit(
+                    fit_func, t_obs, C_obs, p0=q0, sigma=sigma,
+                    bounds=(q_lower, q_upper), method="trf", maxfev=20000,
+                )
+            except RuntimeError:
+                continue  # this start did not converge
+            cost = np.sum(weights * (C_obs - fit_func(t_obs, *q_opt)) ** 2)
+            if best is None or cost < best[0]:
+                best = (cost, q_opt, q_lower, q_upper)
+
+        cost, q_opt, q_lower, q_upper = best
+        fitted, C_bg = np.exp(q_opt[:-1]), q_opt[-1]
+        model_params = to_model(*fitted)
+
+        # Fitted parameters within 0.1% of a bound are not really estimated.
         # C_bg = 0 is a valid result (no background); C_bg at its cap is flagged.
         at_bound = [
-            p for p, q, lo, hi in zip(param_names, q_opt, q_lower, q_upper)
+            p for p, q, lo, hi in zip(names, q_opt, q_lower, q_upper)
             if q - lo < 1e-3 or hi - q < 1e-3
         ]
-        if C_bg_max - q_opt[-1] < 1e-3 * C_bg_max:
+        if C_bg_max - C_bg < 1e-3 * C_bg_max:
             at_bound.append("C_bg")
 
-        def predict(t, func=func, popt=popt, C_bg=C_bg):
-            return func(t, *popt) + C_bg
+        def predict(t, func=func, model_params=model_params, C_bg=C_bg):
+            return func(t, *model_params) + C_bg
 
-        # RMSE with the same sampling weights as the fit (a time average)
-        weights = 1 / sigma**2
-        rmse = np.sqrt(np.sum(weights * (C_obs - predict(t_obs)) ** 2) / np.sum(weights))
+        # Report the fitted parameters plus any model parameters derived
+        # from them (e.g. w for the fracture-matrix model)
+        params = dict(zip(names, fitted))
+        model_names = list(inspect.signature(func).parameters)[1:]  # skip t
+        params.update(
+            (k, v) for k, v in zip(model_names, model_params) if k not in params
+        )
+        params["C_bg"] = C_bg
         results.append(
             {
                 "model": name,
                 "predict": predict,
-                "params": dict(zip(param_names, popt), C_bg=C_bg),
-                "rmse": rmse,
+                "params": params,
+                "rmse": np.sqrt(cost / np.sum(weights)),  # time-weighted
                 "at_bound": at_bound,
             }
         )
