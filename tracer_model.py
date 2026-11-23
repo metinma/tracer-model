@@ -59,7 +59,7 @@ def main():
 
 
 def sauty_uniform(t, t_c, Pe, C_max):
-    """Sauty (1980) Eq. 19-21: slug injection, uniform flow.
+    """Sauty (1980) Eq. 42-44: slug injection, 2D uniform flow, on the flow axis.
 
     t_c = X/u: convective travel time (days)
     Pe = X/alpha_L: longitudinal Peclet number
@@ -68,10 +68,10 @@ def sauty_uniform(t, t_c, Pe, C_max):
     t = np.asarray(t, dtype=float)
     t_R = np.where(t > 0, t, np.nan) / t_c  # dimensionless time
 
-    t_Rmax = np.sqrt(1 + Pe ** (-2)) - 1 / Pe  # Eq. 21
-    K = np.sqrt(t_Rmax) * np.exp(Pe / (4 * t_Rmax) * (1 - t_Rmax) ** 2)  # Eq. 20
+    t_Rmax = np.sqrt(1 + 4 * Pe ** (-2)) - 2 / Pe  # Eq. 44
+    K = t_Rmax * np.exp(Pe * (1 - t_Rmax) ** 2 / (4 * t_Rmax))  # Eq. 43
 
-    C_R = K / np.sqrt(t_R) * np.exp(-Pe / (4 * t_R) * (1 - t_R) ** 2)  # Eq. 19
+    C_R = K / t_R * np.exp(-Pe * (1 - t_R) ** 2 / (4 * t_R))  # Eq. 42
     return np.nan_to_num(C_R * C_max)
 
 
