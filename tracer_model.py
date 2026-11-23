@@ -20,8 +20,7 @@ WELL_PARAMS = {
 
 # Plot style per model: (color, linestyle)
 MODEL_STYLES = {
-    "sauty_1d": ("blue", "-"),
-    "sauty_2d": ("cyan", "-"),
+    "sauty_uniform": ("blue", "-"),
     "bullivant_single_fracture": ("green", "--"),
     "bullivant_fracture_matrix": ("orange", "-."),
     "houseworth_fracture_matrix": ("purple", ":"),
@@ -59,8 +58,8 @@ def main():
 # the paper's Eq. 57).
 
 
-def sauty_1d(t, t_c, Pe, C_max):
-    """Sauty (1980) Eq. 19-21: slug injection, 1D uniform flow.
+def sauty_uniform(t, t_c, Pe, C_max):
+    """Sauty (1980) Eq. 19-21: slug injection, uniform flow.
 
     t_c = X/u: convective travel time (days)
     Pe = X/alpha_L: longitudinal Peclet number
@@ -73,22 +72,6 @@ def sauty_1d(t, t_c, Pe, C_max):
     K = np.sqrt(t_Rmax) * np.exp(Pe / (4 * t_Rmax) * (1 - t_Rmax) ** 2)  # Eq. 20
 
     C_R = K / np.sqrt(t_R) * np.exp(-Pe / (4 * t_R) * (1 - t_R) ** 2)  # Eq. 19
-    return np.nan_to_num(C_R * C_max)
-
-
-def sauty_2d(t, t_c, Pe, C_max):
-    """Sauty (1980) Eq. 42-44: slug injection, 2D uniform flow, on the flow axis.
-
-    Same parameters as sauty_1d. Includes transverse spreading, so the
-    response decays as 1/t_R instead of 1/sqrt(t_R).
-    """
-    t = np.asarray(t, dtype=float)
-    t_R = np.where(t > 0, t, np.nan) / t_c
-
-    t_Rmax = np.sqrt(1 + 4 * Pe ** (-2)) - 2 / Pe  # Eq. 44
-    K = t_Rmax * np.exp(Pe * (1 - t_Rmax) ** 2 / (4 * t_Rmax))  # Eq. 43
-
-    C_R = K / t_R * np.exp(-Pe * (1 - t_R) ** 2 / (4 * t_R))  # Eq. 42
     return np.nan_to_num(C_R * C_max)
 
 
@@ -176,12 +159,8 @@ def fit_analytical_models(t_obs, C_obs):
     # model name: (function, parameter names, shape p0, lower, upper)
     # The last parameter is the amplitude; its p0 and bounds are set below.
     models_config = {
-        "sauty_1d": (
-            sauty_1d, ["t_c", "Pe", "C_max"],
-            [t_peak, 10.0], [0.01, 0.01], [10 * t_max, 1e4],
-        ),
-        "sauty_2d": (
-            sauty_2d, ["t_c", "Pe", "C_max"],
+        "sauty_uniform": (
+            sauty_uniform, ["t_c", "Pe", "C_max"],
             [t_peak, 10.0], [0.01, 0.01], [10 * t_max, 1e4],
         ),
         "bullivant_single_fracture": (
