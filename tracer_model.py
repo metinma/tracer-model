@@ -142,15 +142,37 @@ def robust_peak(t_obs, C_obs, window=5):
     return t_obs[i], smooth[i - window // 2]
 
 
-def fit_analytical_models(t_obs, C_obs):
-    """Fit every model to one well. Returns a list of result dicts.
+def sampling_weights(t_obs):
+    """Curve_fit sigma that makes every day of record count equally.
 
-    Parameters are fitted as log values: all are positive and span several
-    orders of magnitude. Amplitude guesses are scaled so the initial curve
+    Readings are much denser on some periods (e.g. 291 of well B's 398
+    readings fall between days 70 and 190). Weighting each reading by its
+    sampling interval stops dense periods from dominating the fit.
+    """
+    dt = np.gradient(t_obs) if len(t_obs) > 1 else np.ones_like(t_obs)
+    dt = np.maximum(dt, 1e-3 * np.median(dt))  # guard against repeated times
+    return 1 / np.sqrt(dt / np.mean(dt))
+
+
+def fit_analytical_models(t_obs, C_obs):
+    """Fit every model plus a constant background C_bg to one well.
+
+    Returns a list of result dicts. Model parameters are fitted as log
+    values (all are positive and span several orders of magnitude); C_bg is
+    fitted linearly, between 0 and the median of the earliest 10% of
+    readings, since the background cannot exceed what was measured before
+    the tracer arrived. Readings are weighted by their
+    sampling interval. Amplitude guesses are scaled so the initial curve
     passes through the observed peak.
     """
     t_peak, C_peak = robust_peak(t_obs, C_obs)
     t_max = np.max(t_obs)
+    sigma = sampling_weights(t_obs)
+
+    # Background: capped at the early (pre-arrival) level of the readings
+    n_early = max(5, len(C_obs) // 10)
+    C_bg_max = min(np.median(C_obs[:n_early]), C_peak)
+    C_bg0 = 0.5 * C_bg_max
 
     # Shape-parameter guesses consistent with a peak at t_peak
     t_m0 = 1.2 * t_peak
@@ -184,34 +206,44 @@ def fit_analytical_models(t_obs, C_obs):
     for name, (func, param_names, p0, lower, upper) in models_config.items():
         # Amplitude guess: make the initial curve pass through the peak
         shape_at_peak = func(np.array([t_peak]), *p0, 1.0)[0]
-        amp0 = C_peak / shape_at_peak if shape_at_peak > 0 else C_peak
+        amp0 = (C_peak - C_bg0) / shape_at_peak if shape_at_peak > 0 else C_peak
         p0 = p0 + [amp0]
-        lower = lower + [amp0 * 1e-4]
-        upper = upper + [amp0 * 1e4]
+        lower = lower + [amp0 * 1e-8]
+        upper = upper + [amp0 * 1e8]
 
-        def log_func(t, *log_p, func=func):
-            return func(t, *np.exp(log_p))
+        # Fitted vector: log of each model parameter, then C_bg (linear)
+        def fit_func(t, *q, func=func):
+            return func(t, *np.exp(q[:-1])) + q[-1]
 
-        log_lower, log_upper = np.log(lower), np.log(upper)
-        log_p0 = np.clip(np.log(p0), log_lower + 1e-6, log_upper - 1e-6)
-        log_popt, _ = curve_fit(
-            log_func, t_obs, C_obs, p0=log_p0,
-            bounds=(log_lower, log_upper), method="trf", maxfev=20000,
+        q_lower = np.append(np.log(lower), 0.0)
+        q_upper = np.append(np.log(upper), C_bg_max)
+        q0 = np.clip(np.append(np.log(p0), C_bg0), q_lower + 1e-6, q_upper - 1e-6)
+        q_opt, _ = curve_fit(
+            fit_func, t_obs, C_obs, p0=q0, sigma=sigma,
+            bounds=(q_lower, q_upper), method="trf", maxfev=20000,
         )
-        popt = np.exp(log_popt)
+        popt, C_bg = np.exp(q_opt[:-1]), q_opt[-1]
 
-        # Parameters within 0.1% of a bound are not really estimated
+        # Model parameters within 0.1% of a bound are not really estimated.
+        # C_bg = 0 is a valid result (no background); C_bg at its cap is flagged.
         at_bound = [
-            p for p, q, lo, hi in zip(param_names, log_popt, log_lower, log_upper)
+            p for p, q, lo, hi in zip(param_names, q_opt, q_lower, q_upper)
             if q - lo < 1e-3 or hi - q < 1e-3
         ]
+        if C_bg_max - q_opt[-1] < 1e-3 * C_bg_max:
+            at_bound.append("C_bg")
 
-        rmse = np.sqrt(np.mean((C_obs - func(t_obs, *popt)) ** 2))
+        def predict(t, func=func, popt=popt, C_bg=C_bg):
+            return func(t, *popt) + C_bg
+
+        # RMSE with the same sampling weights as the fit (a time average)
+        weights = 1 / sigma**2
+        rmse = np.sqrt(np.sum(weights * (C_obs - predict(t_obs)) ** 2) / np.sum(weights))
         results.append(
             {
                 "model": name,
-                "func": func,
-                "params": dict(zip(param_names, popt)),
+                "predict": predict,
+                "params": dict(zip(param_names, popt), C_bg=C_bg),
                 "rmse": rmse,
                 "at_bound": at_bound,
             }
@@ -220,7 +252,8 @@ def fit_analytical_models(t_obs, C_obs):
 
 
 def print_fit_summary(all_fits):
-    print("\nFit summary  (* = parameter stopped at a bound, not estimated)")
+    print("\nFit summary  (RMSE is time-weighted, in ppb; "
+          "* = parameter stopped at a bound, not estimated)")
     for fit in all_fits:
         params = ", ".join(
             f"{k}={v:.4g}{'*' if k in fit['at_bound'] else ''}"
@@ -336,7 +369,7 @@ def plot_fitted_curves(t_obs, C_obs, fits, well):
         color, linestyle = MODEL_STYLES[fit["model"]]
         plt.plot(
             t_smooth,
-            fit["func"](t_smooth, *fit["params"].values()) / C_max,
+            fit["predict"](t_smooth) / C_max,
             color=color,
             linestyle=linestyle,
             linewidth=2,
