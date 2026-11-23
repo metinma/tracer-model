@@ -18,6 +18,9 @@ WELL_PARAMS = {
     "c": {"dist_m": 1600.0, "delta_p_mpa": 11.0},
 }
 
+# Model curves on the fitted-curve plots extend to this time
+PLOT_T_END_DAYS = 1000.0
+
 # Plot style per model: (color, linestyle)
 MODEL_STYLES = {
     "sauty_uniform": ("blue", "-"),
@@ -324,8 +327,10 @@ def plot_fitted_curves(t_obs, C_obs, fits, well):
         t_obs, C_obs / C_max, color="black", s=15, alpha=0.7, label="Measured Field Data"
     )
 
-    # Smooth time grid for the analytical curves
-    t_smooth = np.linspace(np.min(t_obs), np.max(t_obs), 500)
+    # Smooth time grid for the analytical curves, extended past the data
+    # to show each model's predicted peak and tail
+    t_end = max(PLOT_T_END_DAYS, np.max(t_obs))
+    t_smooth = np.linspace(0, t_end, 1000)
 
     for fit in fits:
         color, linestyle = MODEL_STYLES[fit["model"]]
@@ -341,6 +346,8 @@ def plot_fitted_curves(t_obs, C_obs, fits, well):
     plt.xlabel("Time (days)")
     plt.ylabel(f"$C/C_{{max}}$  ($C_{{max}}$ = {C_max:.3g} ppb)")
     plt.title(f"Analytical Model Fits - Well {well.upper()}")
+    plt.xlim(0, t_end)
+    plt.ylim(0, 1.0)  # measurements above C_max are clipped
     plt.grid(True, linestyle="--", alpha=0.5)
     plt.legend()
 
