@@ -20,7 +20,8 @@ WELL_PARAMS = {
 
 # Plot style per model: (color, linestyle)
 MODEL_STYLES = {
-    "sauty_uniform_radial": ("blue", "-"),
+    "sauty_1d": ("blue", "-"),
+    "sauty_2d": ("cyan", "-"),
     "bullivant_single_fracture": ("green", "--"),
     "bullivant_fracture_matrix": ("orange", "-."),
     "houseworth_fracture_matrix": ("purple", ":"),
@@ -52,122 +53,177 @@ def main():
 # ---------------------------------------------------------------- models
 # Each model takes time t (days) as an array and returns concentration (ppb).
 # Times outside a model's valid range return zero concentration.
+#
+# Equation numbers refer to the original papers. They differ from the
+# numbers in the project description (e.g. its "Eq. 30" for Houseworth is
+# the paper's Eq. 57).
 
 
-def sauty_uniform_radial(t, t_c, Pe, C_max):
-    """Sauty (1980) 1D advection-dispersion, scaled so the peak equals C_max.
+def sauty_1d(t, t_c, Pe, C_max):
+    """Sauty (1980) Eq. 19-21: slug injection, 1D uniform flow.
 
-    t_c: convective (mean travel) time, Pe: Peclet number.
+    t_c = X/u: convective travel time (days)
+    Pe = X/alpha_L: longitudinal Peclet number
+    C_max: peak concentration (ppb)
     """
     t = np.asarray(t, dtype=float)
     t_R = np.where(t > 0, t, np.nan) / t_c  # dimensionless time
 
-    # Dimensionless time of peak concentration and the scaling factor
-    t_Rmax = np.sqrt(1 + Pe ** (-2)) - 1 / Pe
-    K = np.sqrt(t_Rmax) * np.exp(Pe / (4 * t_Rmax) * (1 - t_Rmax) ** 2)
+    t_Rmax = np.sqrt(1 + Pe ** (-2)) - 1 / Pe  # Eq. 21
+    K = np.sqrt(t_Rmax) * np.exp(Pe / (4 * t_Rmax) * (1 - t_Rmax) ** 2)  # Eq. 20
 
-    C_R = K / np.sqrt(t_R) * np.exp(-Pe / (4 * t_R) * (1 - t_R) ** 2)
+    C_R = K / np.sqrt(t_R) * np.exp(-Pe / (4 * t_R) * (1 - t_R) ** 2)  # Eq. 19
     return np.nan_to_num(C_R * C_max)
 
 
-def bullivant_single_fracture(t, t_b, t_p, L):
-    """Bullivant & O'Sullivan (1989) single fracture model.
+def sauty_2d(t, t_c, Pe, C_max):
+    """Sauty (1980) Eq. 42-44: slug injection, 2D uniform flow, on the flow axis.
 
-    t_b: breakthrough time, t_p: peak time, L: amplitude.
+    Same parameters as sauty_1d. Includes transverse spreading, so the
+    response decays as 1/t_R instead of 1/sqrt(t_R).
     """
-    if t_b >= t_p:
-        raise ValueError("Breakthrough time must be less than peak time.")
+    t = np.asarray(t, dtype=float)
+    t_R = np.where(t > 0, t, np.nan) / t_c
 
+    t_Rmax = np.sqrt(1 + 4 * Pe ** (-2)) - 2 / Pe  # Eq. 44
+    K = t_Rmax * np.exp(Pe * (1 - t_Rmax) ** 2 / (4 * t_Rmax))  # Eq. 43
+
+    C_R = K / t_R * np.exp(-Pe * (1 - t_R) ** 2 / (4 * t_R))  # Eq. 42
+    return np.nan_to_num(C_R * C_max)
+
+
+def bullivant_single_fracture(t, t_m, w, L):
+    """Bullivant & O'Sullivan (1989) Eq. 8: single fracture.
+
+    t_m = RA/q: mean arrival time (days)
+    w = qR/(D_Tr A): Peclet number
+    L = (m/4Q)(w/(pi t_m))^0.5: amplitude (ppb day^0.5)
+    """
     t = np.asarray(t, dtype=float)
     t_v = np.where(t > 0, t, np.nan)
 
-    t_m = 2 * t_p - t_b  # mean arrival time
-    w = 6 * t_m * t_p / (t_m**2 - t_p**2)  # Peclet number
-
-    exponent = -w / 4 * (t_v - t_m) ** 2 / t_m / t_v
+    exponent = -w * (t_v - t_m) ** 2 / (4 * t_m * t_v)
     return np.nan_to_num(L * 2 * t_m / t_v**1.5 * np.exp(exponent))
 
 
-def bullivant_fracture_matrix(t, t_p, t_b, L):
-    """Bullivant & O'Sullivan (1989) fracture-matrix model.
+def bullivant_fracture_matrix(t, t_b, w, L):
+    """Bullivant & O'Sullivan (1989) Eq. 17: fracture with matrix diffusion.
 
-    t_p: peak time, t_b: advective breakthrough time, L: amplitude.
+    t_b = RA/q: advective breakthrough time (days)
+    w = (q/RA)(a^2/(D_m n_m^2)): fracture-to-matrix transport ratio
+    L = (m/Q)(t_b/(w pi))^0.5: amplitude (ppb day^1.5)
+    Peak time from Eq. 18: t_p = t_b (1 + 2/(3w)).
     """
     t = np.asarray(t, dtype=float)
-    if t_b >= t_p:
-        return np.full_like(t, 1e9)
-
     dt = np.where(t > t_b, t - t_b, np.nan)  # time after breakthrough
-    w = (2 / 3) * t_b / (t_p - t_b)  # Peclet number
 
     return np.nan_to_num(L / dt**1.5 * np.exp(-t_b / (w * dt)))
 
 
-def houseworth_fracture_matrix(t, t_a, Pe, V_m, A, eta_0=0.0):
-    """Houseworth et al. (2013) fracture-matrix model.
+def houseworth_fracture_matrix(t, t_a, beta, gamma, M):
+    """Houseworth et al. (2013) Eq. 57: fracture concentration, source in fracture.
 
-    t_a: advective arrival time, Pe: Peclet number,
-    V_m: cross-flow term, A: amplitude, eta_0: spatial offset.
+    Eq. 57 with eta_0 = 0 and v_mz = 0, written in physical time using
+    tau - xi = xi * theta, where theta = (t - t_a)/t_a:
+
+        C = M sqrt(beta/pi)/4 * theta^-1.5 * exp(-beta/(4 theta) - gamma theta/4)
+
+    t_a = z/v_f*: advective arrival time (days)
+    beta = xi/Pe = t_a D_m*/l^2: matrix-diffusion strength (dimensionless)
+    gamma = Pe xi V^2: loss by matrix cross-flow (dimensionless)
+    M = 2 M0/(A_f phi_f R_f z): amplitude (ppb)
+    With gamma = 0 this is the same curve as bullivant_fracture_matrix
+    with w = 4/beta, so gamma measures what the matrix flow adds.
     """
     t = np.asarray(t, dtype=float)
-    dt = np.where(t > t_a, t - t_a, np.nan)  # time after arrival
-    offset = 1.0 + eta_0
+    theta = np.where(t > t_a, (t - t_a) / t_a, np.nan)
 
-    diffusive_term = -Pe * offset**2 / (4.0 * dt)
-    crossflow_term = -Pe * V_m**2 * dt / 4.0
-
-    return np.nan_to_num(A * offset / dt**1.5 * np.exp(diffusive_term + crossflow_term))
+    exponent = -beta / (4 * theta) - gamma * theta / 4
+    return np.nan_to_num(M * np.sqrt(beta / np.pi) / 4 / theta**1.5 * np.exp(exponent))
 
 
 # --------------------------------------------------------------- fitting
 
 
+def robust_peak(t_obs, C_obs, window=5):
+    """Time and value of the peak of a running median, so single outliers
+    do not set the initial guesses."""
+    if len(C_obs) < window:
+        i = np.argmax(C_obs)
+        return t_obs[i], C_obs[i]
+    smooth = np.median(np.lib.stride_tricks.sliding_window_view(C_obs, window), axis=1)
+    i = np.argmax(smooth) + window // 2
+    return t_obs[i], smooth[i - window // 2]
+
+
 def fit_analytical_models(t_obs, C_obs):
-    """Fit every model to one well. Returns a list of result dicts."""
-    # Initial guesses from the observed peak
-    peak_idx = np.argmax(C_obs)
-    t_peak = t_obs[peak_idx] if t_obs[peak_idx] > 0 else 1.0
-    C_peak = C_obs[peak_idx] if C_obs[peak_idx] > 0 else 1.0
-    t_b_guess = t_peak * 0.5
+    """Fit every model to one well. Returns a list of result dicts.
+
+    Parameters are fitted as log values: all are positive and span several
+    orders of magnitude. Amplitude guesses are scaled so the initial curve
+    passes through the observed peak.
+    """
+    t_peak, C_peak = robust_peak(t_obs, C_obs)
     t_max = np.max(t_obs)
 
-    # model name: (function, parameter names, p0, lower bounds, upper bounds)
+    # Shape-parameter guesses consistent with a peak at t_peak
+    t_m0 = 1.2 * t_peak
+    w_sf0 = 6 * t_m0 * t_peak / (t_m0**2 - t_peak**2)  # B&O Eq. 9
+    t_b0 = 0.5 * t_peak
+    w_fm0 = (2 / 3) * t_b0 / (t_peak - t_b0)  # B&O Eq. 18
+    beta0 = 6.0  # Houseworth peak at theta = beta/6 when gamma = 0
+
+    # model name: (function, parameter names, shape p0, lower, upper)
+    # The last parameter is the amplitude; its p0 and bounds are set below.
     models_config = {
-        "sauty_uniform_radial": (
-            sauty_uniform_radial,
-            ["t_c", "Pe", "C_max"],
-            [t_peak, 10.0, C_peak],
-            [0.1, 0.1, 1e-5],
-            [t_max * 2.0, 500.0, C_peak * 5.0],
+        "sauty_1d": (
+            sauty_1d, ["t_c", "Pe", "C_max"],
+            [t_peak, 10.0], [0.01, 0.01], [10 * t_max, 1e4],
+        ),
+        "sauty_2d": (
+            sauty_2d, ["t_c", "Pe", "C_max"],
+            [t_peak, 10.0], [0.01, 0.01], [10 * t_max, 1e4],
         ),
         "bullivant_single_fracture": (
-            bullivant_single_fracture,
-            ["t_b", "t_p", "L"],
-            [t_b_guess, t_peak, C_peak],
-            [0.01, 0.1, 1e-5],
-            [t_peak * 0.99, t_max, C_peak * 10.0],
+            bullivant_single_fracture, ["t_m", "w", "L"],
+            [t_m0, w_sf0], [0.01, 0.01], [10 * t_max, 1e4],
         ),
         "bullivant_fracture_matrix": (
-            bullivant_fracture_matrix,
-            ["t_p", "t_b", "L"],
-            [t_peak, t_b_guess, C_peak],
-            [0.1, 0.01, 1e-5],
-            [t_max, t_peak * 0.99, C_peak * 10.0],
+            bullivant_fracture_matrix, ["t_b", "w", "L"],
+            [t_b0, w_fm0], [0.01, 1e-4], [t_max, 1e4],
         ),
         "houseworth_fracture_matrix": (
-            houseworth_fracture_matrix,
-            ["t_a", "Pe", "V_m", "A"],
-            [t_b_guess, 10.0, 0.1, C_peak],
-            [0.01, 0.1, 1e-4, 1e-5],
-            [t_peak * 0.99, 500.0, 10.0, C_peak * 10.0],
+            houseworth_fracture_matrix, ["t_a", "beta", "gamma", "M"],
+            [t_b0, beta0, 1e-3], [0.01, 1e-4, 1e-8], [t_max, 1e4, 1e4],
         ),
     }
 
     results = []
     for name, (func, param_names, p0, lower, upper) in models_config.items():
-        popt, _ = curve_fit(
-            func, t_obs, C_obs, p0=p0, bounds=(lower, upper), method="trf"
+        # Amplitude guess: make the initial curve pass through the peak
+        shape_at_peak = func(np.array([t_peak]), *p0, 1.0)[0]
+        amp0 = C_peak / shape_at_peak if shape_at_peak > 0 else C_peak
+        p0 = p0 + [amp0]
+        lower = lower + [amp0 * 1e-4]
+        upper = upper + [amp0 * 1e4]
+
+        def log_func(t, *log_p, func=func):
+            return func(t, *np.exp(log_p))
+
+        log_lower, log_upper = np.log(lower), np.log(upper)
+        log_p0 = np.clip(np.log(p0), log_lower + 1e-6, log_upper - 1e-6)
+        log_popt, _ = curve_fit(
+            log_func, t_obs, C_obs, p0=log_p0,
+            bounds=(log_lower, log_upper), method="trf", maxfev=20000,
         )
+        popt = np.exp(log_popt)
+
+        # Parameters within 0.1% of a bound are not really estimated
+        at_bound = [
+            p for p, q, lo, hi in zip(param_names, log_popt, log_lower, log_upper)
+            if q - lo < 1e-3 or hi - q < 1e-3
+        ]
+
         rmse = np.sqrt(np.mean((C_obs - func(t_obs, *popt)) ** 2))
         results.append(
             {
@@ -175,15 +231,19 @@ def fit_analytical_models(t_obs, C_obs):
                 "func": func,
                 "params": dict(zip(param_names, popt)),
                 "rmse": rmse,
+                "at_bound": at_bound,
             }
         )
     return results
 
 
 def print_fit_summary(all_fits):
-    print("\nFit summary")
+    print("\nFit summary  (* = parameter stopped at a bound, not estimated)")
     for fit in all_fits:
-        params = ", ".join(f"{k}={v:.4g}" for k, v in fit["params"].items())
+        params = ", ".join(
+            f"{k}={v:.4g}{'*' if k in fit['at_bound'] else ''}"
+            for k, v in fit["params"].items()
+        )
         print(f"  {fit['well'].upper()}  {fit['model']:<28} "
               f"RMSE={fit['rmse']:.3f}  {params}")
 
@@ -191,10 +251,11 @@ def print_fit_summary(all_fits):
 def save_fit_summary(all_fits, path):
     with open(path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["well", "model", "rmse", "parameters"])
+        writer.writerow(["well", "model", "rmse", "parameters", "at_bound"])
         for fit in all_fits:
             params = "; ".join(f"{k}={v:.6g}" for k, v in fit["params"].items())
-            writer.writerow([fit["well"], fit["model"], f"{fit['rmse']:.6g}", params])
+            writer.writerow([fit["well"], fit["model"], f"{fit['rmse']:.6g}",
+                             params, "; ".join(fit["at_bound"])])
 
 
 # -------------------------------------------------------------- data I/O
