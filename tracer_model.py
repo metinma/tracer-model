@@ -130,7 +130,7 @@ def houseworth_fracture_matrix(t, t_a, beta, gamma, M):
 
 def robust_peak(t_obs, C_obs, window=5):
     """Time and value of the peak of a running median, so single outliers
-    do not set the initial guesses."""
+    do not set the initial guesses or the C_max used to normalize plots."""
     if len(C_obs) < window:
         i = np.argmax(C_obs)
         return t_obs[i], C_obs[i]
@@ -311,8 +311,18 @@ def plot_tracer_data(tracer_data):
 
 
 def plot_fitted_curves(t_obs, C_obs, fits, well):
+    """Plot measured and fitted curves as C/C_max against time.
+
+    Measurements and all models are divided by the same C_max (the
+    running-median peak of the measurements), so the fitted curves still
+    overlay the data and RMSE is shown as a fraction of C_max.
+    """
+    _, C_max = robust_peak(t_obs, C_obs)
+
     plt.figure(figsize=(10, 6))
-    plt.scatter(t_obs, C_obs, color="black", s=15, alpha=0.7, label="Measured Field Data")
+    plt.scatter(
+        t_obs, C_obs / C_max, color="black", s=15, alpha=0.7, label="Measured Field Data"
+    )
 
     # Smooth time grid for the analytical curves
     t_smooth = np.linspace(np.min(t_obs), np.max(t_obs), 500)
@@ -321,15 +331,15 @@ def plot_fitted_curves(t_obs, C_obs, fits, well):
         color, linestyle = MODEL_STYLES[fit["model"]]
         plt.plot(
             t_smooth,
-            fit["func"](t_smooth, *fit["params"].values()),
+            fit["func"](t_smooth, *fit["params"].values()) / C_max,
             color=color,
             linestyle=linestyle,
             linewidth=2,
-            label=f"{fit['model']} (RMSE: {fit['rmse']:.2f})",
+            label=f"{fit['model']} (RMSE: {fit['rmse'] / C_max:.3f})",
         )
 
     plt.xlabel("Time (days)")
-    plt.ylabel("Tracer Concentration (ppb)")
+    plt.ylabel(f"$C/C_{{max}}$  ($C_{{max}}$ = {C_max:.3g} ppb)")
     plt.title(f"Analytical Model Fits - Well {well.upper()}")
     plt.grid(True, linestyle="--", alpha=0.5)
     plt.legend()
