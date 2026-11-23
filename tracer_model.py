@@ -1,4 +1,5 @@
 import csv
+import inspect
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -17,6 +18,9 @@ WELL_PARAMS = {
     "d": {"dist_m": 1500.0, "delta_p_mpa": 10.0},
     "c": {"dist_m": 1600.0, "delta_p_mpa": 11.0},
 }
+
+# Model curves on the fitted-curve plots extend to this time
+PLOT_T_END_DAYS = 1000.0
 
 # Plot style per model: (color, linestyle)
 MODEL_STYLES = {
@@ -130,7 +134,7 @@ def houseworth_fracture_matrix(t, t_a, beta, gamma, M):
 
 def robust_peak(t_obs, C_obs, window=5):
     """Time and value of the peak of a running median, so single outliers
-    do not set the initial guesses."""
+    do not set the initial guesses or the C_max used to normalize plots."""
     if len(C_obs) < window:
         i = np.argmax(C_obs)
         return t_obs[i], C_obs[i]
@@ -139,77 +143,144 @@ def robust_peak(t_obs, C_obs, window=5):
     return t_obs[i], smooth[i - window // 2]
 
 
-def fit_analytical_models(t_obs, C_obs):
-    """Fit every model to one well. Returns a list of result dicts.
+def sampling_weights(t_obs):
+    """Curve_fit sigma that makes every day of record count equally.
 
-    Parameters are fitted as log values: all are positive and span several
-    orders of magnitude. Amplitude guesses are scaled so the initial curve
-    passes through the observed peak.
+    Readings are much denser on some periods (e.g. 291 of well B's 398
+    readings fall between days 70 and 190). Weighting each reading by its
+    sampling interval stops dense periods from dominating the fit.
+    """
+    dt = np.gradient(t_obs) if len(t_obs) > 1 else np.ones_like(t_obs)
+    dt = np.maximum(dt, 1e-3 * np.median(dt))  # guard against repeated times
+    return 1 / np.sqrt(dt / np.mean(dt))
+
+
+def _fm_to_model(t_b, dt_p, L):
+    """Bullivant fracture-matrix: fitted (t_b, t_p - t_b, L) -> (t_b, w, L).
+
+    Eq. 18 gives w = (2/3) t_b / (t_p - t_b). Fitting the peak delay
+    dt_p = t_p - t_b instead of w keeps t_p > t_b and bounds the peak time.
+    """
+    return t_b, (2 / 3) * t_b / dt_p, L
+
+
+def fit_analytical_models(t_obs, C_obs):
+    """Fit every model plus a constant background C_bg to one well.
+
+    Returns a list of result dicts. Model parameters are fitted as log
+    values (all are positive and span several orders of magnitude); C_bg is
+    fitted linearly, between 0 and the median of the earliest 10% of
+    readings, since the background cannot exceed what was measured before
+    the tracer arrived. Readings are weighted by their sampling interval.
+
+    Each model is fitted from several starting points and the best fit is
+    kept, so the result does not depend on one initial guess. Amplitude
+    guesses are scaled so each initial curve passes through the observed peak.
     """
     t_peak, C_peak = robust_peak(t_obs, C_obs)
     t_max = np.max(t_obs)
+    sigma = sampling_weights(t_obs)
+    weights = 1 / sigma**2
 
-    # Shape-parameter guesses consistent with a peak at t_peak
-    t_m0 = 1.2 * t_peak
-    w_sf0 = 6 * t_m0 * t_peak / (t_m0**2 - t_peak**2)  # B&O Eq. 9
-    t_b0 = 0.5 * t_peak
-    w_fm0 = (2 / 3) * t_b0 / (t_peak - t_b0)  # B&O Eq. 18
-    beta0 = 6.0  # Houseworth peak at theta = beta/6 when gamma = 0
+    # Background: capped at the early (pre-arrival) level of the readings
+    n_early = max(5, len(C_obs) // 10)
+    C_bg_max = min(np.median(C_obs[:n_early]), C_peak)
+    C_bg0 = 0.5 * C_bg_max
 
-    # model name: (function, parameter names, shape p0, lower, upper)
-    # The last parameter is the amplitude; its p0 and bounds are set below.
+    # Starting points, each consistent with a peak near t_peak
+    arrival_fracs = [0.05, 0.2, 0.4, 0.6, 0.8, 0.9]
+    sauty_starts = [[f * t_peak, pe] for f in (1.0, 1.5) for pe in (3.0, 10.0, 30.0)]
+    sf_starts = [
+        [f * t_peak, 6 * f / (f**2 - 1)]  # B&O Eq. 9 with t_m = f t_peak
+        for f in (1.05, 1.2, 1.5, 2.0)
+    ]
+    fm_starts = [[f * t_peak, (1 - f) * t_peak] for f in arrival_fracs]
+    hw_starts = [
+        [f * t_peak, 6 * (1 - f) / f, gamma]  # peak at theta = beta/6
+        for f in arrival_fracs for gamma in (1e-3, 0.1)
+    ]
+
+    # model name: (function, fitted parameter names, starting points,
+    #              lower, upper, map from fitted to model parameters)
+    # The last fitted parameter is the amplitude; its guess and bounds are
+    # set below from the observed peak.
     models_config = {
         "sauty_uniform": (
-            sauty_uniform, ["t_c", "Pe", "C_max"],
-            [t_peak, 10.0], [0.01, 0.01], [10 * t_max, 1e4],
+            sauty_uniform, ["t_c", "Pe", "C_max"], sauty_starts,
+            [0.01, 0.01], [10 * t_max, 1e4], None,
         ),
         "bullivant_single_fracture": (
-            bullivant_single_fracture, ["t_m", "w", "L"],
-            [t_m0, w_sf0], [0.01, 0.01], [10 * t_max, 1e4],
+            bullivant_single_fracture, ["t_m", "w", "L"], sf_starts,
+            [0.01, 0.01], [10 * t_max, 1e4], None,
         ),
         "bullivant_fracture_matrix": (
-            bullivant_fracture_matrix, ["t_b", "w", "L"],
-            [t_b0, w_fm0], [0.01, 1e-4], [t_max, 1e4],
+            bullivant_fracture_matrix, ["t_b", "dt_p", "L"], fm_starts,
+            [0.01, 0.01], [t_max, 2 * t_max], _fm_to_model,
         ),
         "houseworth_fracture_matrix": (
-            houseworth_fracture_matrix, ["t_a", "beta", "gamma", "M"],
-            [t_b0, beta0, 1e-3], [0.01, 1e-4, 1e-8], [t_max, 1e4, 1e4],
+            houseworth_fracture_matrix, ["t_a", "beta", "gamma", "M"], hw_starts,
+            [0.01, 1e-4, 1e-8], [t_max, 1e4, 1e4], None,
         ),
     }
 
     results = []
-    for name, (func, param_names, p0, lower, upper) in models_config.items():
-        # Amplitude guess: make the initial curve pass through the peak
-        shape_at_peak = func(np.array([t_peak]), *p0, 1.0)[0]
-        amp0 = C_peak / shape_at_peak if shape_at_peak > 0 else C_peak
-        p0 = p0 + [amp0]
-        lower = lower + [amp0 * 1e-4]
-        upper = upper + [amp0 * 1e4]
+    for name, (func, names, starts, lower, upper, to_model) in models_config.items():
+        to_model = to_model or (lambda *p: p)
 
-        def log_func(t, *log_p, func=func):
-            return func(t, *np.exp(log_p))
+        def fit_func(t, *q, func=func, to_model=to_model):
+            return func(t, *to_model(*np.exp(q[:-1]))) + q[-1]
 
-        log_lower, log_upper = np.log(lower), np.log(upper)
-        log_p0 = np.clip(np.log(p0), log_lower + 1e-6, log_upper - 1e-6)
-        log_popt, _ = curve_fit(
-            log_func, t_obs, C_obs, p0=log_p0,
-            bounds=(log_lower, log_upper), method="trf", maxfev=20000,
-        )
-        popt = np.exp(log_popt)
+        best = None
+        for shape0 in starts:
+            # Amplitude guess: make the initial curve pass through the peak
+            shape_at_peak = func(np.array([t_peak]), *to_model(*shape0, 1.0))[0]
+            amp0 = (C_peak - C_bg0) / shape_at_peak if shape_at_peak > 0 else C_peak
 
-        # Parameters within 0.1% of a bound are not really estimated
+            q_lower = np.append(np.log(lower + [amp0 * 1e-8]), 0.0)
+            q_upper = np.append(np.log(upper + [amp0 * 1e8]), C_bg_max)
+            q0 = np.append(np.log(shape0 + [amp0]), C_bg0)
+            q0 = np.clip(q0, q_lower + 1e-6, q_upper - 1e-6)
+            try:
+                q_opt, _ = curve_fit(
+                    fit_func, t_obs, C_obs, p0=q0, sigma=sigma,
+                    bounds=(q_lower, q_upper), method="trf", maxfev=20000,
+                )
+            except RuntimeError:
+                continue  # this start did not converge
+            cost = np.sum(weights * (C_obs - fit_func(t_obs, *q_opt)) ** 2)
+            if best is None or cost < best[0]:
+                best = (cost, q_opt, q_lower, q_upper)
+
+        cost, q_opt, q_lower, q_upper = best
+        fitted, C_bg = np.exp(q_opt[:-1]), q_opt[-1]
+        model_params = to_model(*fitted)
+
+        # Fitted parameters within 0.1% of a bound are not really estimated.
+        # C_bg = 0 is a valid result (no background); C_bg at its cap is flagged.
         at_bound = [
-            p for p, q, lo, hi in zip(param_names, log_popt, log_lower, log_upper)
+            p for p, q, lo, hi in zip(names, q_opt, q_lower, q_upper)
             if q - lo < 1e-3 or hi - q < 1e-3
         ]
+        if C_bg_max - C_bg < 1e-3 * C_bg_max:
+            at_bound.append("C_bg")
 
-        rmse = np.sqrt(np.mean((C_obs - func(t_obs, *popt)) ** 2))
+        def predict(t, func=func, model_params=model_params, C_bg=C_bg):
+            return func(t, *model_params) + C_bg
+
+        # Report the fitted parameters plus any model parameters derived
+        # from them (e.g. w for the fracture-matrix model)
+        params = dict(zip(names, fitted))
+        model_names = list(inspect.signature(func).parameters)[1:]  # skip t
+        params.update(
+            (k, v) for k, v in zip(model_names, model_params) if k not in params
+        )
+        params["C_bg"] = C_bg
         results.append(
             {
                 "model": name,
-                "func": func,
-                "params": dict(zip(param_names, popt)),
-                "rmse": rmse,
+                "predict": predict,
+                "params": params,
+                "rmse": np.sqrt(cost / np.sum(weights)),  # time-weighted
                 "at_bound": at_bound,
             }
         )
@@ -217,7 +288,8 @@ def fit_analytical_models(t_obs, C_obs):
 
 
 def print_fit_summary(all_fits):
-    print("\nFit summary  (* = parameter stopped at a bound, not estimated)")
+    print("\nFit summary  (RMSE is time-weighted, in ppb; "
+          "* = parameter stopped at a bound, not estimated)")
     for fit in all_fits:
         params = ", ".join(
             f"{k}={v:.4g}{'*' if k in fit['at_bound'] else ''}"
@@ -311,26 +383,40 @@ def plot_tracer_data(tracer_data):
 
 
 def plot_fitted_curves(t_obs, C_obs, fits, well):
-    plt.figure(figsize=(10, 6))
-    plt.scatter(t_obs, C_obs, color="black", s=15, alpha=0.7, label="Measured Field Data")
+    """Plot measured and fitted curves as C/C_max against time.
 
-    # Smooth time grid for the analytical curves
-    t_smooth = np.linspace(np.min(t_obs), np.max(t_obs), 500)
+    Measurements and all models are divided by the same C_max (the
+    running-median peak of the measurements), so the fitted curves still
+    overlay the data and RMSE is shown as a fraction of C_max.
+    """
+    _, C_max = robust_peak(t_obs, C_obs)
+
+    plt.figure(figsize=(10, 6))
+    plt.scatter(
+        t_obs, C_obs / C_max, color="black", s=15, alpha=0.7, label="Measured Field Data"
+    )
+
+    # Smooth time grid for the analytical curves, extended past the data
+    # to show each model's predicted peak and tail
+    t_end = max(PLOT_T_END_DAYS, np.max(t_obs))
+    t_smooth = np.linspace(0, t_end, 1000)
 
     for fit in fits:
         color, linestyle = MODEL_STYLES[fit["model"]]
         plt.plot(
             t_smooth,
-            fit["func"](t_smooth, *fit["params"].values()),
+            fit["predict"](t_smooth) / C_max,
             color=color,
             linestyle=linestyle,
             linewidth=2,
-            label=f"{fit['model']} (RMSE: {fit['rmse']:.2f})",
+            label=f"{fit['model']} (RMSE: {fit['rmse'] / C_max:.3f})",
         )
 
     plt.xlabel("Time (days)")
-    plt.ylabel("Tracer Concentration (ppb)")
+    plt.ylabel(f"$C/C_{{max}}$  ($C_{{max}}$ = {C_max:.3g} ppb)")
     plt.title(f"Analytical Model Fits - Well {well.upper()}")
+    plt.xlim(0, t_end)
+    plt.ylim(0, 1.2)  # measurements far above C_max are clipped
     plt.grid(True, linestyle="--", alpha=0.5)
     plt.legend()
 
