@@ -265,10 +265,14 @@ def import_tracer_data(data_dir):
     """Return {well: (time_days, concentration_ppb)}, sorted by time.
 
     Files have a '%' title line, a 'ppb days' header, then two columns.
+    Zero readings are an artifact of the measurement tool and are dropped,
+    along with any missing (NaN) values.
     """
     tracer_data = {}
     for file in sorted(Path(data_dir).glob("*.txt")):
         C, t = np.loadtxt(file, skiprows=2, unpack=True)
+        keep = np.isfinite(C) & np.isfinite(t) & (C != 0)
+        C, t = C[keep], t[keep]
         order = np.argsort(t, kind="stable")
         tracer_data[file.stem] = (t[order], C[order])
     return tracer_data
@@ -316,9 +320,7 @@ def plot_3d_spatial_data(coordinates):
 
 def plot_tracer_data(tracer_data):
     for well, (t, C) in tracer_data.items():
-        # Skip missing (NaN) and zero concentrations
-        mask = np.isfinite(C) & (C != 0)
-        plt.scatter(t[mask], C[mask], label=f"C_{well}", s=2)
+        plt.scatter(t, C, label=f"C_{well}", s=2)
 
     plt.xlabel("Time (days)")
     plt.ylabel("Tracer Concentration (ppb)")
