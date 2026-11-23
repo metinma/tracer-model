@@ -347,7 +347,7 @@ def plot_fitted_curves(t_obs, C_obs, fits, well):
     plt.ylabel(f"$C/C_{{max}}$  ($C_{{max}}$ = {C_max:.3g} ppb)")
     plt.title(f"Analytical Model Fits - Well {well.upper()}")
     plt.xlim(0, t_end)
-    plt.ylim(0, 1.0)  # measurements above C_max are clipped
+    plt.ylim(0, 1.2)  # measurements far above C_max are clipped
     plt.grid(True, linestyle="--", alpha=0.5)
     plt.legend()
 
