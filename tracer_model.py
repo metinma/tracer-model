@@ -387,7 +387,14 @@ def plot_fitted_curves(tracer_data, well_name):
 def plot_tracer_data(tracer_data):
     for column in tracer_data.columns:
         if column != "Time":
-            plt.scatter(tracer_data["Time"], tracer_data[column], label=column, s=2)
+            # Skip missing (NaN) and zero concentrations
+            mask = tracer_data[column].notna() & (tracer_data[column] != 0)
+            plt.scatter(
+                tracer_data.loc[mask, "Time"],
+                tracer_data.loc[mask, column],
+                label=column,
+                s=2,
+            )
 
     plt.xlabel("Time (days)")
     plt.ylabel("Tracer Concentration (ppb)")
