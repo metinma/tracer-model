@@ -27,6 +27,16 @@ TABLE_2 = {
     "houseworth": {"h": 2e-4},
 }
 
+# Shape parameters held fixed, as in Figure 1 of the project description.
+# The brief does not give the constants it used; these reproduce Figure 1.
+D_M = 1e-10                    # matrix diffusion coefficient [m2/s]
+DAY = 86400.0
+# B&O Eq. 8: Peclet number w, read off Figure 1 (no relation to h = 3 mm found).
+W_SINGLE_FRACTURE = 15.0
+# B&O Eq. 17: w * t_b = h^2 / (D_m * phi_m) [days], from the Table 2 h and phi_m.
+G_FRACTURE_MATRIX = (TABLE_2["bullivant_fracture_matrix"]["h"] ** 2
+                     / (D_M * TABLE_2["bullivant_fracture_matrix"]["phi_matrix"]) / DAY)
+
 
 def main():
     os.makedirs(FIG_DIR, exist_ok=True)
@@ -36,13 +46,13 @@ def main():
     geometry = geometric_parameters(wells, fault)
     plot_field(wells, fault, geometry)
 
-    print(f"\n{'well':>4} {'model':>26} {'parameters':>45} {'RMSE':>8}")
+    print(f"\n{'well':>4} {'model':>44} {'parameters':>40} {'RMSE':>6}")
     for w in WELLS:
         btc = process_btc(*load_btc(w))
         fits = fit_models(btc)
         for name, fit in fits.items():
             p = ", ".join(f"{k}={v:.3g}" for k, v in fit["params"].items())
-            print(f"{w:>4} {name:>26} {p:>45} {fit['rmse']:8.3f}")
+            print(f"{w:>4} {name:>44} {p:>40} {fit['rmse']:6.3f}")
         plot_fits(w, btc, fits)
 
     plt.show()
@@ -146,11 +156,11 @@ def plot_field(wells, fault, geometry):
     fig.savefig(f"{FIG_DIR}/field.png", dpi=150)
 
 
-# All models return concentration in ppb. The shape is scaled so that its
-# peak equals A, which is fitted because the injected tracer mass is unknown.
+# All models return C/C_max: each curve is scaled so that its own peak is 1,
+# as in Figure 1 of the project description.
 
 # func: Sauty's uniform flow.
-def sauty(t, t_c, P, A, y_R=0.0):
+def sauty(t, t_c, P, y_R=0.0):
     """Sauty (1980) Eqs. 39-42: slug injection in 2-D uniform flow.
 
     t_c: convective transit time [days], P = X / alpha_L (longitudinal Peclet),
@@ -164,11 +174,25 @@ def sauty(t, t_c, P, A, y_R=0.0):
     def log_shape(x):                            # Eq. 39 without the constant K
         return -np.log(x) - (a2 + x**2) / (4.0 * x)
 
-    return A * np.exp(log_shape(tR) - log_shape(tR_max))
+    return np.exp(log_shape(tR) - log_shape(tR_max))
+
+
+def sauty_1d(t, t_c, P):
+    """Sauty (1980) Eq. 22 with K' from Eq. 23 ("Eq. 23" in Figure 1).
+
+    1-D uniform flow, derivative of the step solution (flux concentration).
+    """
+    tR = np.maximum(t / t_c, 1e-12)
+    tR_max = np.sqrt(1.0 + 9.0 / P**2) - 3.0 / P     # Eq. 23
+
+    def log_shape(x):
+        return -1.5 * np.log(x) - P * (1.0 - x) ** 2 / (4.0 * x)
+
+    return np.exp(log_shape(tR) - log_shape(tR_max))
 
 
 # func: Bullivant's single fracture flow.
-def bullivant_single_fracture(t, t_m, w, A):
+def bullivant_single_fracture(t, t_m, w):
     """Bullivant & O'Sullivan (1989) Eq. 8.
 
     t_m: mean arrival time [days], w: Peclet number q R / (D_Tr A).
@@ -179,21 +203,21 @@ def bullivant_single_fracture(t, t_m, w, A):
     def log_shape(x):
         return -1.5 * np.log(x) - w * (x - t_m) ** 2 / (4.0 * t_m * x)
 
-    return A * np.exp(log_shape(t) - log_shape(t_p))
+    return np.exp(log_shape(t) - log_shape(t_p))
 
 
 # func: Bullivant's fracture matrix flow.
-def bullivant_fracture_matrix(t, t_b, w, A):
+def bullivant_fracture_matrix(t, t_b, w):
     """Bullivant & O'Sullivan (1989) Eq. 17.
 
     t_b: arrival time without matrix diffusion [days],
     w = (q / R A) a^2 / (D_m n_m^2).
     """
-    return houseworth(t, t_b, w, 0.0, A)
+    return houseworth(t, t_b, w, 0.0)
 
 
 # func: Houseworth's fracture matrix flow.
-def houseworth(t, t_b, w, k, A):
+def houseworth(t, t_b, w, k):
     """Houseworth et al. (2013) Eq. 57, fracture concentration.
 
     Source in the fracture (eta_0 = 0) and negligible longitudinal matrix
@@ -212,36 +236,43 @@ def houseworth(t, t_b, w, k, A):
     def log_shape(x):
         return -1.5 * np.log(x) - t_b / (w * x) - k * x / t_b
 
-    return np.where(after, A * np.exp(log_shape(s) - log_shape(s_p)), 0.0)
+    return np.where(after, np.exp(log_shape(s) - log_shape(s_p)), 0.0)
 
 
 # func: fit models.
 def fit_models(btc):
-    """Fit the models for every well using SciPy's NLLS algorithm."""
-    t_arr, t_p, C_p = btc["t_arrival"], btc["t_peak"], btc["C_peak"]
-    t_end = btc["t"][-1]
-    A_bounds = (0.2 * C_p, 5.0 * C_p)
+    """Fit the models for every well using SciPy's NLLS algorithm.
 
-    # (function, parameter names, starting points, lower bounds, upper bounds)
+    The models are fitted to C/C_max. Sauty and Houseworth fit all their
+    parameters; for the two Bullivant models the shape is held fixed (see the
+    constants at the top) and only the time scale is fitted.
+    """
+    t_p, t_end = btc["t_peak"], btc["t"][-1]
+    G = G_FRACTURE_MATRIX
+
+    # label: (function, parameter names, starting points, lower bounds, upper bounds)
     setups = {
-        "Sauty Eq. 39-42": (
-            sauty, ["t_c", "P", "A"],
-            [[f * t_p, P, C_p] for f in (1.0, 1.5, 2.5) for P in (3.0, 10.0, 50.0)],
-            [0.5 * t_arr, 0.1, A_bounds[0]], [10.0 * t_end, 1e3, A_bounds[1]]),
-        "B&O single fracture Eq. 8": (
-            bullivant_single_fracture, ["t_m", "w", "A"],
-            [[t_m, 6 * t_m * t_p / (t_m**2 - t_p**2), C_p]          # Eqs. 9 and 42
-             for t_m in (2 * t_p - t_arr, 1.5 * t_p, 3.0 * t_p)],
-            [0.5 * t_arr, 0.1, A_bounds[0]], [10.0 * t_end, 1e3, A_bounds[1]]),
-        "B&O fracture-matrix Eq. 17": (
-            bullivant_fracture_matrix, ["t_b", "w", "A"],
-            [[f * t_p, 2 * f / (3 * (1 - f)), C_p] for f in (0.2, 0.4, 0.6, 0.8)],  # Eq. 18
-            [0.0, 1e-6, A_bounds[0]], [t_p, 1e3, A_bounds[1]]),
-        "Houseworth Eq. 57": (
-            houseworth, ["t_b", "w", "k", "A"],
-            [[f * t_p, 2 * f / (3 * (1 - f)), k, C_p]
+        "Eq. 23": (
+            sauty_1d, ["t_c", "P"],
+            [[f * t_p, P] for f in (1.0, 1.5) for P in (3.0, 10.0, 30.0)],
+            [1.0, 0.1], [10.0 * t_end, 1e3]),
+        "Uniform porous - Sauty (1980)": (
+            sauty, ["t_c", "P"],
+            [[f * t_p, P] for f in (1.0, 1.5) for P in (3.0, 10.0, 30.0)],
+            [1.0, 0.1], [10.0 * t_end, 1e3]),
+        "Single fracture - Bullivant & Sul.(1989)": (
+            lambda t, t_m: bullivant_single_fracture(t, t_m, W_SINGLE_FRACTURE), ["t_m"],
+            [[f * t_p] for f in (1.0, 1.5, 2.0)],
+            [1.0], [10.0 * t_end]),
+        "Fracture-matrix - Bullivant & Sul. (1989)": (
+            lambda t, t_b: bullivant_fracture_matrix(t, t_b, G / t_b), ["t_b"],
+            [[f * t_p] for f in (0.2, 0.5, 0.8)],
+            [1.0], [t_p]),
+        "Fracture-matrix - Houseworth et al. (2013)": (
+            houseworth, ["t_b", "w", "k"],
+            [[f * t_p, 2 * f / (3 * (1 - f)), k]                 # Eq. 18 of B&O
              for f in (0.2, 0.4, 0.6, 0.8) for k in (0.0, 0.1, 1.0)],
-            [0.0, 1e-6, 0.0, A_bounds[0]], [t_p, 1e3, 1e2, A_bounds[1]]),
+            [0.0, 1e-6, 0.0], [t_p, 1e3, 1e2]),
     }
 
     return {name: fit_model(func, names, starts, lower, upper, btc)
@@ -249,11 +280,11 @@ def fit_models(btc):
 
 
 def fit_model(func, names, starts, lower, upper, btc):
-    """Weighted least squares from several starting points; keep the best."""
-    t, C, sw = btc["t"], btc["C"], np.sqrt(btc["weights"])
+    """Weighted least squares on C/C_max from several starting points; keep the best."""
+    t, y, sw = btc["t"], btc["C"] / btc["C_peak"], np.sqrt(btc["weights"])
 
     def residuals(p):
-        return sw * (func(t, *p) - C)
+        return sw * (func(t, *p) - y)
 
     best = None
     for p0 in starts:
@@ -262,25 +293,43 @@ def fit_model(func, names, starts, lower, upper, btc):
         if best is None or res.cost < best.cost:
             best = res
 
-    rmse = np.sqrt(np.mean((func(t, *best.x) - C) ** 2))
+    rmse = np.sqrt(np.mean((func(t, *best.x) - y) ** 2))
     return {"func": func, "params": dict(zip(names, best.x)), "rmse": rmse}
 
 
-# Draw graphs for time (days) vs C/Cmax for every well.
-def plot_fits(well, btc, fits):
-    t, C, C_max = btc["t"], btc["C"], btc["C_peak"]
-    t_fine = np.linspace(0.0, 1.5 * t[-1], 1000)
+# Draw graphs for time (days) vs C/Cmax for every well, in the style of Figure 1.
+STYLES = {
+    "Eq. 23": dict(ls="-"),
+    "Uniform porous - Sauty (1980)": dict(ls="--"),
+    "Single fracture - Bullivant & Sul.(1989)": dict(ls="-."),
+    "Fracture-matrix - Bullivant & Sul. (1989)": dict(ls=":"),
+    "Fracture-matrix - Houseworth et al. (2013)": dict(ls="-", marker="x", markevery=40, ms=4),
+}
 
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(t, C / C_max, "o", ms=3, mfc="none", color="k", label="Measurement")
-    for name, fit in fits.items():
-        ax.plot(t_fine, fit["func"](t_fine, *fit["params"].values()) / C_max, label=name)
+
+def plot_fits(well, btc, fits):
+    t, y = btc["t"], btc["C"] / btc["C_peak"]
+    t_fine = np.linspace(0.0, 1000.0, 2001)
+
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    names = list(fits)
+    # Same legend order as Figure 1: Eq. 23, Measurement, then the four models.
+    ax.plot(t_fine, fits[names[0]]["func"](t_fine, *fits[names[0]]["params"].values()),
+            color="k", lw=1, label=names[0], **STYLES[names[0]])
+    ax.plot(t, y, "o", ms=4, mfc="none", color="k", label="Measurement")
+    for name in names[1:]:
+        fit = fits[name]
+        ax.plot(t_fine, fit["func"](t_fine, *fit["params"].values()),
+                color="k", lw=1, label=name, **STYLES[name])
     ax.set_xlabel("time (days)")
-    ax.set_ylabel("C/C$_{max}$")
-    ax.set_ylim(0.0, 1.5)
+    ax.set_ylabel("$c/c_{max}$")
+    ax.set_xlim(0.0, 1000.0)
+    ax.set_ylim(0.0, 1.1)
+    ax.set_yticks([0, 0.2, 0.4, 0.6, 0.8, 1.0], ["0", ".2", ".4", ".6", ".8", "1"])
+    ax.grid(color="0.85")
+    ax.legend(loc="upper right", frameon=False, fontsize=8)
     ax.set_title(f"A1 -> {well.upper()}")
-    ax.grid(alpha=0.3)
-    ax.legend()
+    fig.tight_layout()
     fig.savefig(f"{FIG_DIR}/fit_{well}.png", dpi=150)
 
 
