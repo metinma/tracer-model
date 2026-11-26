@@ -8,7 +8,6 @@ from scipy.signal import medfilt
 
 WELLS = ["b", "c", "d", "e", "f"]
 INJECTOR = "a1"
-EXCLUDED_FROM_TENSOR = ["e"]    # wells left out of the permeability tensor
 MAX_CONDITION = 10.0            # above this the tensor is not resolvable
 FIG_DIR = "figures"
 RESULTS_FILE = "results.txt"
@@ -69,13 +68,13 @@ def main():
                          f"{k / MILLIDARCY:.0f}", f"{h_cubic * 1e6:.1f}", "-", f"{fit['rmse']:.3f}"])
 
     # Anisotropy in the fault plane.
-    tensor_wells = [w for w in WELLS if w not in EXCLUDED_FROM_TENSOR]
+    tensor_wells = WELLS
     e1, e2, _ = fault_plane(geometry)
     for name, k_by_well in k_by_model.items():
         k = [k_by_well[w] for w in tensor_wells]
         t = permeability_tensor(k, [geometry[w]["direction"] for w in tensor_wells], e1, e2)
         if t["cond"] > MAX_CONDITION or t["k_min"] <= 0:
-            # Only the down-dip permeability is constrained: report its geometric mean.
+            # Tensor not resolvable: report the geometric mean of k.
             k_text = f"{np.exp(np.mean(np.log(k))) / MILLIDARCY:.0f}"
             anisotropy = f"n/r (cond {t['cond']:.0f})"
         else:
