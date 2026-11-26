@@ -27,10 +27,10 @@ TABLE_2 = {
     "houseworth": {"h": 2e-4},
 }
 
-# Constants the brief does not give, taken from the papers.
-D_0 = 1e-10     # molecular diffusion coefficient in the fracture [m2/s] (B&O Eq. 46)
-D_M = 1e-10     # matrix diffusion coefficient [m2/s] (Houseworth Table 3)
-PHI_M_HOUSEWORTH = TABLE_2["bullivant_fracture_matrix"]["phi_matrix"]  # not in Table 2's Houseworth row
+# Constants the brief does not give: solute diffusion in water is of the
+# order of 1e-9 m2/s (Houseworth et al. 2013, paragraph 16).
+D_0 = 1e-9      # molecular diffusion coefficient in the fracture [m2/s]
+D_M = 1e-9      # matrix diffusion coefficient [m2/s]
 DAY = 86400.0
 
 
@@ -45,7 +45,7 @@ def main():
     print(f"\n{'well':>4} {'model':>44} {'parameters':>40} {'RMSE':>6}")
     for w in WELLS:
         btc = process_btc(*load_btc(w))
-        fits = fit_models(btc, TABLE_1[w][0], geometry[w]["y"])
+        fits = fit_models(btc, TABLE_1[w][0])
         for name, fit in fits.items():
             p = ", ".join(f"{k}={v:.3g}" for k, v in fit["params"].items())
             print(f"{w:>4} {name:>44} {p:>40} {fit['rmse']:6.3f}")
@@ -109,9 +109,7 @@ def geometric_parameters(wells, fault):
         # Find straight distance between the intersection points.
         L = np.linalg.norm(v)
         # Find the direction vector for anisotropy calculations.
-        # Horizontal offset, used as the transverse distance y in Sauty's 2-D solution.
-        y = np.linalg.norm(v[:2])
-        geometry[w] = {"point": points[w], "L": L, "y": y, "direction": v / L}
+        geometry[w] = {"point": points[w], "L": L, "direction": v / L}
     geometry[INJECTOR] = {"point": points[INJECTOR]}
     return geometry
 
@@ -238,54 +236,70 @@ def houseworth(t, t_b, w, k):
 
 
 # func: fit models.
-def fit_models(btc, dz, y):
+def fit_models(btc, dz):
     """Fit the models for every well using SciPy's NLLS algorithm.
 
-    The models are fitted to C/C_max. The Table 2 values fix the shape of each
-    curve, so only the time scale (and the Houseworth cross-flow k) is fitted.
-    dz: flow distance from Table 1 [m], y: transverse distance [m].
+    The models are fitted to C/C_max with the Table 2 values held fixed.
+    Besides the time scale of every model, only these are fitted:
+      - the flow path length L for Sauty and the single fracture (the true
+        path through the fault is unknown; dz from Table 1 is the first guess),
+      - the fracture aperture h for the B&O fracture-matrix model. Its Table 2
+        value (3 mm) would need a matrix diffusion coefficient ~500 times that
+        of water to fit, so h is estimated with phi_m = 0.005 kept,
+      - the matrix cross-flow k for Houseworth.
     """
-    t_end = btc["t"][-1]
-    starts = [[t0] for t0 in np.linspace(btc["t_arrival"], t_end, 15)]
+    t_end, t_p = btc["t"][-1], btc["t_peak"]
+    times = np.linspace(btc["t_arrival"], t_end, 8)
+    lengths = (0.5 * dz, dz, 2.0 * dz)
 
-    # Sauty: Peclet numbers from alpha_L and alpha_T (Eqs. 26, 27, 33).
-    s = TABLE_2["sauty"]
-    P = dz / s["alpha_L"]
-    y_R = y / np.sqrt(s["alpha_L"] * s["alpha_T"])
+    # Sauty: the producer is on the flow axis of the forced flow A1 -> producer,
+    # so y = 0 and alpha_T drops out of Eqs. 39-42; P = L / alpha_L (Eq. 26).
+    alpha_L = TABLE_2["sauty"]["alpha_L"]
 
-    # B&O single fracture: Taylor dispersion (Eqs. 4, 11, 12) gives
-    # w = 210 D_0 t_m / h^2, with t_m in seconds.
+    # B&O single fracture: Taylor dispersion (Eq. 4) plus mechanical dispersion
+    # alpha_L u, since real fractures disperse far more than parallel plates
+    # (Houseworth section 6). w = q R / (D A) = L / (alpha_L + D_Tr / u), with
+    # D_Tr / u = u h^2 / (210 D_0) and u = L / t_m.
     h_sf = TABLE_2["bullivant_single_fracture"]["h"]
 
-    def w_single_fracture(t_m):
-        return 210.0 * D_0 * t_m * DAY / h_sf**2
+    def w_single_fracture(t_m, L):
+        u = L / (t_m * DAY)
+        return L / (alpha_L + u * h_sf**2 / (210.0 * D_0))
 
-    # B&O fracture-matrix: w = (q / R A) a^2 / (D_m n_m^2) = h^2 / (t_b D_m phi_m^2).
-    fm = TABLE_2["bullivant_fracture_matrix"]
-    G_fm = fm["h"] ** 2 / (D_M * fm["phi_matrix"] ** 2) / DAY          # w * t_b [days]
+    # Fracture-matrix models: w = (q / R A) a^2 / (D_m n_m^2) = h^2 / (t_b D_m phi_m^2)
+    # (B&O Eq. 17; Houseworth Eq. 57 with l = b / (2 phi_m) gives the same group).
+    # Houseworth's Table 2 row gives no phi_m; the B&O value is used (same rock).
+    phi_m = TABLE_2["bullivant_fracture_matrix"]["phi_matrix"]
+    h_hw = TABLE_2["houseworth"]["h"]
 
-    # Houseworth: l = b phi_f / (2 phi_m) with phi_f = 1 gives the same w * t_b
-    # group as B&O, h^2 / (D_m phi_m^2).
-    G_hw = TABLE_2["houseworth"]["h"] ** 2 / (D_M * PHI_M_HOUSEWORTH**2) / DAY
+    def w_fracture_matrix(h, t_b, phi_m):
+        return h**2 / (t_b * DAY * D_M * phi_m**2)
 
     # label: (function, parameter names, starting points, lower bounds, upper bounds)
     setups = {
         "Eq. 23": (
-            lambda t, t_c: sauty_1d(t, t_c, P), ["t_c"],
-            starts, [1.0], [10.0 * t_end]),
+            lambda t, t_c, L: sauty_1d(t, t_c, L / alpha_L), ["t_c", "L"],
+            [[t0, L] for t0 in times for L in lengths],
+            [1.0, 10.0], [10.0 * t_end, 1e4]),
         "Uniform porous - Sauty (1980)": (
-            lambda t, t_c: sauty(t, t_c, P, y_R), ["t_c"],
-            starts, [1.0], [10.0 * t_end]),
+            lambda t, t_c, L: sauty(t, t_c, L / alpha_L), ["t_c", "L"],
+            [[t0, L] for t0 in times for L in lengths],
+            [1.0, 10.0], [10.0 * t_end, 1e4]),
         "Single fracture - Bullivant & Sul.(1989)": (
-            lambda t, t_m: bullivant_single_fracture(t, t_m, w_single_fracture(t_m)), ["t_m"],
-            starts, [1.0], [10.0 * t_end]),
+            lambda t, t_m, L: bullivant_single_fracture(t, t_m, w_single_fracture(t_m, L)),
+            ["t_m", "L"],
+            [[t0, L] for t0 in times for L in lengths],
+            [1.0, 10.0], [10.0 * t_end, 1e4]),
         "Fracture-matrix - Bullivant & Sul. (1989)": (
-            lambda t, t_b: bullivant_fracture_matrix(t, t_b, G_fm / t_b), ["t_b"],
-            starts, [1.0], [10.0 * t_end]),
+            lambda t, t_b, h: bullivant_fracture_matrix(t, t_b, w_fracture_matrix(h, t_b, phi_m)),
+            ["t_b", "h"],
+            [[f * t_p, h] for f in (0.2, 0.5, 0.8) for h in (5e-5, 2e-4, 1e-3)],
+            [1.0, 1e-6], [t_p, 1e-2]),
         "Fracture-matrix - Houseworth et al. (2013)": (
-            lambda t, t_b, k: houseworth(t, t_b, G_hw / t_b, k), ["t_b", "k"],
-            [[t0[0], k] for t0 in starts for k in (0.0, 0.1, 1.0)],
-            [1.0, 0.0], [10.0 * t_end, 1e2]),
+            lambda t, t_b, k: houseworth(t, t_b, w_fracture_matrix(h_hw, t_b, phi_m), k),
+            ["t_b", "k"],
+            [[f * t_p, k] for f in (0.2, 0.5, 0.8) for k in (0.0, 0.1, 1.0, 10.0)],
+            [1.0, 0.0], [t_p, 1e2]),
     }
 
     return {name: fit_model(func, names, starts, lower, upper, btc)
