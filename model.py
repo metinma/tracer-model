@@ -31,7 +31,9 @@ TABLE_2 = {
 # order of 1e-9 m2/s (Houseworth et al. 2013, paragraph 16).
 D_0 = 1e-9      # molecular diffusion coefficient in the fracture [m2/s]
 D_M = 1e-9      # matrix diffusion coefficient [m2/s]
+MU = 2e-4       # water viscosity at ~150 C [Pa s]; reservoir temperature is not given
 DAY = 86400.0
+MILLIDARCY = 9.869233e-16   # [m2]
 
 
 def main():
@@ -42,6 +44,7 @@ def main():
     geometry = geometric_parameters(wells, fault)
     plot_field(wells, fault, geometry)
 
+    all_fits = {}
     print(f"\n{'well':>4} {'model':>44} {'parameters':>40} {'RMSE':>6}")
     for w in WELLS:
         btc = process_btc(*load_btc(w))
@@ -50,6 +53,20 @@ def main():
             p = ", ".join(f"{k}={v:.3g}" for k, v in fit["params"].items())
             print(f"{w:>4} {name:>44} {p:>40} {fit['rmse']:6.3f}")
         plot_fits(w, btc, fits)
+        all_fits[w] = fits
+
+    # L is the model's fitted path length where it has one, otherwise dz (Table 1).
+    print(f"\nDarcy's law with dP from Table 1, mu = {MU:g} Pa s")
+    print(f"{'well':>4} {'model':>44} {'L (m)':>6} {'t_adv (d)':>9} {'v (m/d)':>8} "
+          f"{'k (m2)':>9} {'k (mD)':>8} {'h_cubic (um)':>12}")
+    for w, fits in all_fits.items():
+        dz, dP = TABLE_1[w]
+        for name, fit in fits.items():
+            L = fit["params"].get("L", dz)
+            t_adv = list(fit["params"].values())[0]      # t_c, t_m or t_b
+            v, k, h = permeability(L, t_adv, dP)
+            print(f"{w:>4} {name:>44} {L:6.0f} {t_adv:9.1f} {v * DAY:8.2f} "
+                  f"{k:9.2e} {k / MILLIDARCY:8.0f} {h * 1e6:12.2f}")
 
     plt.show()
 
@@ -322,6 +339,21 @@ def fit_model(func, names, starts, lower, upper, btc):
 
     rmse = np.sqrt(np.mean((func(t, *best.x) - y) ** 2))
     return {"func": func, "params": dict(zip(names, best.x)), "rmse": rmse}
+
+
+# func: permeability.
+def permeability(L, t_adv, dP):
+    """Effective fracture permeability from Darcy's law and the cubic law.
+
+    The tracer moves with the fluid velocity in the fracture, v = L / t_adv.
+    Inside an open fracture the Darcy flux equals that velocity, so
+        k = mu v L / dP            (Darcy's law)
+        h = sqrt(12 k)             (cubic law, k = h^2 / 12)
+    L [m], t_adv [days], dP [MPa]. Returns v [m/s], k [m2], h [m].
+    """
+    v = L / (t_adv * DAY)
+    k = MU * v * L / (dP * 1e6)
+    return v, k, np.sqrt(12.0 * k)
 
 
 # Draw graphs for time (days) vs C/Cmax for every well, in the style of Figure 1.
