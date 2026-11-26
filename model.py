@@ -1,7 +1,7 @@
 import os
 
-import numpy as np
 import matplotlib.pyplot as plt
+import numpy as np
 from scipy.interpolate import griddata
 from scipy.optimize import least_squares
 from scipy.signal import medfilt
@@ -56,7 +56,7 @@ def main():
         for name, fit in fits.items():
             p = fit["params"]
             L = p.get("L", dz)              # fitted path length, otherwise dz (Table 1)
-            t_adv = list(p.values())[0]     # t_c, t_m or t_b
+            t_adv = next(iter(p.values()))  # t_c, t_m or t_b
             v, k, h_cubic = permeability(L, t_adv, dP)
             k_by_model.setdefault(name, {})[w] = k
             values = dict(FIXED_VALUES[name])
@@ -450,10 +450,10 @@ def permeability_tensor(k, directions, e1, e2):
 
 # Draw graphs for time (days) vs C/Cmax for every well, in the style of Figure 1.
 STYLES = {
-    "Uniform porous - Sauty (1980)": dict(ls="--"),
-    "Single fracture - Bullivant & Sul.(1989)": dict(ls="-."),
-    "Fracture-matrix - Bullivant & Sul. (1989)": dict(ls=":"),
-    "Fracture-matrix - Houseworth et al. (2013)": dict(ls="-", marker="x", markevery=40, ms=4),
+    "Uniform porous - Sauty (1980)": {"ls": "--"},
+    "Single fracture - Bullivant & Sul.(1989)": {"ls": "-."},
+    "Fracture-matrix - Bullivant & Sul. (1989)": {"ls": ":"},
+    "Fracture-matrix - Houseworth et al. (2013)": {"ls": "-", "marker": "x", "markevery": 40, "ms": 4},
 }
 
 
@@ -463,10 +463,10 @@ def plot_fits(well, btc, fits):
 
     fig, ax = plt.subplots(figsize=(7, 4.5))
     ax.plot(t, y, "o", ms=4, mfc="none", color="k", label="Measurement")
-    for name in STYLES:
+    for name, style in STYLES.items():
         fit = fits[name]
         ax.plot(t_fine, fit["func"](t_fine, *fit["params"].values()),
-                color="k", lw=1, label=name, **STYLES[name])
+                color="k", lw=1, label=name, **style)
     ax.set_xlabel("time (days)")
     ax.set_ylabel("$c/c_{max}$")
     ax.set_xlim(0.0, 1000.0)
