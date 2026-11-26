@@ -150,10 +150,13 @@ def load_well(well):
 
 
 # func: process btc data.
-def process_btc(t, C, n_background=5, kernel=5, arrival_fraction=0.05):
-    # Substract a fixed background concentration.
-    background = np.median(C[:n_background])
-    C = np.clip(C - background, 0.0, None)
+def process_btc(t, C, background_percentile=5, kernel=5, arrival_fraction=0.05):
+    # Substract a fixed background concentration: the noise floor of the probe,
+    # taken as a low percentile of the whole record. This needs no arrival time
+    # and is not affected by early bumps or spikes. Readings slightly below the
+    # background are kept (not clipped) so the noise is not biased upwards.
+    background = np.percentile(C, background_percentile)
+    C = C - background
 
     # Handle noise: the median filter is only used to find the peak and the
     # arrival; the models are fitted to the raw (background-free) data.
