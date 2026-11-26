@@ -9,8 +9,9 @@ from scipy.signal import medfilt
 WELLS = ["b", "c", "d", "e", "f"]
 INJECTOR = "a1"
 MAX_CONDITION = 10.0            # above this the tensor is not resolvable
-FIG_DIR = "figures"
-RESULTS_FILE = "results.txt"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+FIG_DIR = os.path.join(BASE_DIR, "figures")
+RESULTS_FILE = os.path.join(BASE_DIR, "results.txt")
 
 # Table 1: A1 -> producer, (dz [m], dP [MPa]).
 TABLE_1 = {
@@ -30,7 +31,7 @@ TABLE_2 = {
 }
 
 # Assumed constants (not given in the brief).
-D_0 = 1e-9                  # molecular diffusion in the fracture [m2/s] (Houseworth 2013, p. 16)
+D_0 = 1e-9                  # molecular diffusion in the fracture [m2/s] (Houseworth 2013, para. 16)
 D_M = 1e-9                  # matrix diffusion [m2/s]
 MU = 2e-4                   # water viscosity at ~150 C [Pa s]
 DAY = 86400.0               # [s]
@@ -42,7 +43,7 @@ def main():
     os.makedirs(FIG_DIR, exist_ok=True)
 
     wells = {w: load_well(w) for w in [INJECTOR] + WELLS}
-    fault = np.loadtxt("coordinates/fault.txt", skiprows=1)
+    fault = np.loadtxt(os.path.join(BASE_DIR, "coordinates", "fault.txt"), skiprows=1)
     geometry = geometric_parameters(wells, fault)
     plot_field(wells, fault, geometry)
 
@@ -56,15 +57,15 @@ def main():
             p = fit["params"]
             L = p.get("L", dz)              # fitted path length, else dz
             t_adv = next(iter(p.values()))  # t_c, t_m or t_b
-            v, k, h_cubic = permeability(L, t_adv, dP)
+            v = L / (t_adv * DAY)
+            k, h_cubic = permeability(v, dz, dP)
             k_by_model.setdefault(name, {})[w] = k
             values = dict(FIXED_VALUES[name])
             values.update({key: (val, "*") for key, val in p.items() if key in ("L", "h")})
             values.setdefault("L", (L, ""))
             rows.append([w.upper(), SHORT_NAMES[name],
                          cell(values, "L", "{:.0f}"), f"{v * DAY:.2f}",
-                         cell(values, "alpha_L", "{:.0f}"), cell(values, "alpha_T", "{:.0f}"),
-                         cell(values, "phi_m", "{:.3f}"), cell(values, "h", "{:.3f}", 1e3),
+                         cell(values, "alpha_L", "{:.0f}"), cell(values, "phi_m", "{:.3f}"), cell(values, "h", "{:.3f}", 1e3),
                          f"{k / MILLIDARCY:.0f}", f"{h_cubic * 1e6:.1f}", "-", f"{fit['rmse']:.3f}"])
 
     # Anisotropy in the fault plane.
@@ -80,20 +81,17 @@ def main():
         else:
             k_text = f"{t['k_max'] / MILLIDARCY:.0f}/{t['k_min'] / MILLIDARCY:.0f}"
             anisotropy = f"{t['k_max'] / t['k_min']:.1f} at {t['azimuth']:.0f}/{t['plunge']:.0f}"
-        rows.append(["".join(tensor_wells).upper(), SHORT_NAMES[name], "-", "-", "-", "-", "-",
+        rows.append(["".join(tensor_wells).upper(), SHORT_NAMES[name], "-", "-", "-", "-",
                      "-", k_text, "-", anisotropy, "-"])
 
-    header = ["Well", "Model", "L (m)", "v (m/d)", "aL (m)", "aT (m)", "phi_m", "h (mm)",
+    header = ["Well", "Model", "L (m)", "v (m/d)", "aL (m)", "phi_m", "h (mm)",
               "k (mD)", "h_cubic (um)", "k_max/k_min", "RMSE"]
     write_table(header, rows, RESULTS_FILE)
-
-    plt.show()
 
 
 # Table 2 values reported for each model, as (value, marker).
 FIXED_VALUES = {
-    "Uniform porous - Sauty (1980)": {"alpha_L": (TABLE_2["sauty"]["alpha_L"], ""),
-                                      "alpha_T": (TABLE_2["sauty"]["alpha_T"], "")},
+    "Uniform porous - Sauty (1980)": {"alpha_L": (TABLE_2["sauty"]["alpha_L"], "")},
     "Single fracture - Bullivant & Sul.(1989)": {
         "alpha_L": (TABLE_2["sauty"]["alpha_L"], ""),
         "h": (TABLE_2["bullivant_single_fracture"]["h"], "")},
@@ -136,7 +134,7 @@ def load_btc(well):
 
     Zero readings are probe glitches and are dropped.
     """
-    data = np.loadtxt(f"tracer_data/{well}.txt", skiprows=2)
+    data = np.loadtxt(os.path.join(BASE_DIR, "tracer_data", f"{well}.txt"), skiprows=2)
     data = data[data[:, 0] != 0.0]
     C, t = data[:, 0], data[:, 1]
     order = np.argsort(t, kind="stable")
@@ -145,7 +143,7 @@ def load_btc(well):
 
 def load_well(well):
     """Return the well trajectory as an (n, 3) array of x, y, z [m]."""
-    return np.loadtxt(f"coordinates/{well}.txt", skiprows=1)
+    return np.loadtxt(os.path.join(BASE_DIR, "coordinates", f"{well}.txt"), skiprows=1)
 
 
 def process_btc(t, C, background_percentile=5, kernel=5, arrival_fraction=0.05):
@@ -167,19 +165,18 @@ def process_btc(t, C, background_percentile=5, kernel=5, arrival_fraction=0.05):
     t_peak = t[i_peak]
     t_arrival = t[np.argmax(C_smooth > arrival_fraction * C_peak)]
 
-    return {"t": t, "C": C, "weights": weights, "background": background,
-            "C_peak": C_peak, "t_arrival": t_arrival, "t_peak": t_peak}
+    return {"t": t, "C": C, "weights": weights, "C_peak": C_peak,
+            "t_arrival": t_arrival, "t_peak": t_peak}
 
 
 def geometric_parameters(wells, fault):
-    """Well-fault intersections, and distance and direction from A1 to each producer."""
+    """Well-fault intersections and the direction from A1 to each producer."""
     points = {w: fault_intersection(xyz, fault) for w, xyz in wells.items()}
 
     geometry = {}
     for w in WELLS:
         v = points[w] - points[INJECTOR]
-        L = np.linalg.norm(v)
-        geometry[w] = {"point": points[w], "L": L, "direction": v / L}
+        geometry[w] = {"point": points[w], "direction": v / np.linalg.norm(v)}
     geometry[INJECTOR] = {"point": points[INJECTOR]}
     return geometry
 
@@ -215,7 +212,8 @@ def plot_field(wells, fault, geometry):
     ax.set_zlabel("z (m)")
     ax.legend()
     ax.set_title("Wells and fault (dots: well-fault intersections)")
-    fig.savefig(f"{FIG_DIR}/field.png", dpi=150)
+    fig.savefig(os.path.join(FIG_DIR, "field.png"), dpi=150)
+    plt.close(fig)
 
 
 # Every model returns C/C_max, scaled so that its peak is 1.
@@ -353,15 +351,14 @@ def fit_model(func, names, starts, lower, upper, btc):
     return {"func": func, "params": dict(zip(names, best.x)), "rmse": rmse}
 
 
-def permeability(L, t_adv, dP):
-    """Fracture velocity, permeability (Darcy's law) and aperture (cubic law).
+def permeability(v, dz, dP):
+    """Permeability (Darcy's law) and aperture (cubic law) for a fracture velocity.
 
-    v = L / t_adv, k = mu v L / dP, h = sqrt(12 k).
-    L [m], t_adv [days], dP [MPa] -> v [m/s], k [m2], h [m].
+    k = mu v dz / dP with the Table 1 pressure gradient for every model; h = sqrt(12 k).
+    v [m/s], dz [m], dP [MPa] -> k [m2], h [m].
     """
-    v = L / (t_adv * DAY)
-    k = MU * v * L / (dP * 1e6)
-    return v, k, np.sqrt(12.0 * k)
+    k = MU * v * dz / (dP * 1e6)
+    return k, np.sqrt(12.0 * k)
 
 
 def fault_plane(geometry):
@@ -390,17 +387,14 @@ def permeability_tensor(k, directions, e1, e2):
     k = np.asarray(k)
     # Relative residuals, so every well counts equally.
     (a, b, c), *_ = np.linalg.lstsq(A / k[:, None], np.ones_like(k), rcond=None)
-    K = np.array([[a, b], [b, c]])
-
-    values, vectors = np.linalg.eigh(K)
+    values, vectors = np.linalg.eigh(np.array([[a, b], [b, c]]))
     v_max = vectors[0, 1] * e1 + vectors[1, 1] * e2          # direction of k_max
     if v_max[2] > 0:
         v_max = -v_max
     azimuth = np.degrees(np.arctan2(v_max[0], v_max[1])) % 360.0
     plunge = np.degrees(np.arcsin(-v_max[2]))
-    misfit = np.sqrt(np.mean((A @ [a, b, c] / k - 1.0) ** 2))
-    return {"K": K, "k_max": values[1], "k_min": values[0], "azimuth": azimuth,
-            "plunge": plunge, "cond": np.linalg.cond(A), "misfit": misfit}
+    return {"k_max": values[1], "k_min": values[0], "azimuth": azimuth,
+            "plunge": plunge, "cond": np.linalg.cond(A)}
 
 
 # Line style of each model in the plots (Figure 1 of the brief).
@@ -432,7 +426,8 @@ def plot_fits(well, btc, fits):
     ax.legend(loc="upper right", frameon=False, fontsize=8)
     ax.set_title(f"A1 -> {well.upper()}")
     fig.tight_layout()
-    fig.savefig(f"{FIG_DIR}/fit_{well}.png", dpi=150)
+    fig.savefig(os.path.join(FIG_DIR, f"fit_{well}.png"), dpi=150)
+    plt.close(fig)
 
 
 if __name__ == "__main__":
