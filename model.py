@@ -37,6 +37,7 @@ def main():
 
 # func: fit models.
 # Fit the models for every well using SciPy's NLLS algorithm.
+# Draw graphs for time (days) vs C/Cmax for every well.
 
 if __name__ == "__main__":
     main()
