@@ -132,8 +132,12 @@ def write_table(header, rows, path):
 
 # func: load btc data.
 def load_btc(well):
-    """Return time [days] and concentration [ppb], sorted by time."""
+    """Return time [days] and concentration [ppb], sorted by time.
+
+    Readings of exactly zero are probe glitches and are dropped.
+    """
     data = np.loadtxt(f"tracer_data/{well}.txt", skiprows=2)
+    data = data[data[:, 0] != 0.0]
     C, t = data[:, 0], data[:, 1]
     order = np.argsort(t, kind="stable")
     return t[order], C[order]
@@ -455,8 +459,7 @@ def plot_fits(well, btc, fits):
     t_fine = np.linspace(0.0, 1000.0, 2001)
 
     fig, ax = plt.subplots(figsize=(7, 4.5))
-    nonzero = y > 0                     # zero values are fitted but not plotted
-    ax.plot(t[nonzero], y[nonzero], "o", ms=4, mfc="none", color="k", label="Measurement")
+    ax.plot(t, y, "o", ms=4, mfc="none", color="k", label="Measurement")
     for name in STYLES:
         fit = fits[name]
         ax.plot(t_fine, fit["func"](t_fine, *fit["params"].values()),
