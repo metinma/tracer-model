@@ -11,6 +11,7 @@ INJECTOR = "a1"
 EXCLUDED_FROM_TENSOR = ["e"]    # no usable breakthrough curve
 MAX_CONDITION = 10.0          # larger: the well directions cannot resolve a tensor
 FIG_DIR = "figures"
+RESULTS_FILE = "results.txt"
 
 # TABLE 1: injector A1 -> producer: (dz [m], dP [MPa])
 TABLE_1 = {
@@ -85,11 +86,7 @@ def main():
 
     header = ["Well", "Model", "L (m)", "v (m/d)", "aL (m)", "aT (m)", "phi_m", "h (mm)",
               "k (mD)", "h_cubic (um)", "k_max/k_min", "RMSE"]
-    print_table(header, rows)
-    print("* fitted; other aL, aT, phi_m and h values are fixed from Table 2. "
-          f"k from Darcy's law with dP from Table 1 and mu = {MU:g} Pa s; h_cubic from k = h^2/12.\n"
-          f"Rows {''.join(tensor_wells).upper()}: k along dip (geometric mean) when the tensor is "
-          "not resolvable (n/r), else k_max/k_min with the k_max azimuth/plunge.")
+    write_table(header, rows, RESULTS_FILE)
 
     plt.show()
 
@@ -126,13 +123,13 @@ def cell(values, key, fmt, scale=1.0):
     return fmt.format(value * scale) + marker
 
 
-def print_table(header, rows):
+def write_table(header, rows, path):
     widths = [max(len(str(r[i])) for r in [header] + rows) for i in range(len(header))]
     line = "  ".join(h.rjust(n) for h, n in zip(header, widths))
-    print(line)
-    print("-" * len(line))
-    for r in rows:
-        print("  ".join(str(c).rjust(n) for c, n in zip(r, widths)))
+    lines = [line, "-" * len(line)]
+    lines += ["  ".join(str(c).rjust(n) for c, n in zip(r, widths)) for r in rows]
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
 
 
 # func: load btc data.
