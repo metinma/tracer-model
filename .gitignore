@@ -5,4 +5,6 @@ __pycache__/
 venv/
 .DS_Store
 fit_summary.csv
-*.jpg
+field_overview.jpg
+tracer_data.jpg
+/fitted_curves
