@@ -7,4 +7,4 @@ venv/
 fit_summary.csv
 field_overview.jpg
 tracer_data.jpg
-/fitted_curves
+/fits
