@@ -39,9 +39,12 @@ def main():
 
     all_fits = []
     for well in PRODUCERS:
-        t_obs, C_obs = tracer_data[well]
+        t_obs, C_raw = tracer_data[well]
+        C_bg = estimate_background(C_raw)
+        C_obs = np.clip(C_raw - C_bg, 0.0, None)
         fits = fit_analytical_models(t_obs, C_obs)
-        plot_fitted_curves(t_obs, C_obs, fits, well)
+        plot_fitted_curves(t_obs, C_obs, fits, well, C_bg)
+        print(f"  {well}: background removed = {C_bg:.3g} ppb")
         all_fits += [dict(fit, well=well) for fit in fits]
 
     print_fit_summary(all_fits)
@@ -81,6 +84,17 @@ def houseworth_fracture_matrix(t, t_a, beta, gamma, M):
     return np.nan_to_num(M * np.sqrt(beta / np.pi) / 4 / theta**1.5 * np.exp(exponent))
 
 
+def estimate_background(C_obs):
+    """Background level of the measured data, outside the tracer plume.
+
+    Taken as the lower of the median of the first and last 10% of samples, so
+    that a record ending near its peak, or starting with residual tracer, does
+    not inflate it.
+    """
+    n = max(5, len(C_obs) // 10)
+    return min(np.median(C_obs[:n]), np.median(C_obs[-n:]))
+
+
 def robust_peak(t_obs, C_obs, window=5):
     if len(C_obs) < window:
         i = np.argmax(C_obs)
@@ -105,10 +119,6 @@ def fit_analytical_models(t_obs, C_obs):
     t_max = np.max(t_obs)
     sigma = sampling_weights(t_obs)
     weights = 1 / sigma**2
-
-    n_early = max(5, len(C_obs) // 10)
-    C_bg_max = min(np.median(C_obs[:n_early]), C_peak)
-    C_bg0 = 0.5 * C_bg_max
 
     arrival_fracs = [0.05, 0.2, 0.4, 0.6, 0.8, 0.9]
     sauty_starts = [[f * t_peak, pe] for f in (1.0, 1.5) for pe in (3.0, 10.0, 30.0)]
@@ -163,17 +173,17 @@ def fit_analytical_models(t_obs, C_obs):
         to_model = to_model or (lambda *p: p)
 
         def fit_func(t, *q, func=func, to_model=to_model):
-            return func(t, *to_model(*np.exp(q[:-1]))) + q[-1]
+            return func(t, *to_model(*np.exp(q)))
 
         best = None
         for shape0 in starts:
             # Amplitude guess: make the initial curve pass through the peak
             shape_at_peak = func(np.array([t_peak]), *to_model(*shape0, 1.0))[0]
-            amp0 = (C_peak - C_bg0) / shape_at_peak if shape_at_peak > 0 else C_peak
+            amp0 = C_peak / shape_at_peak if shape_at_peak > 0 else C_peak
 
-            q_lower = np.append(np.log(lower + [amp0 * 1e-8]), 0.0)
-            q_upper = np.append(np.log(upper + [amp0 * 1e8]), C_bg_max)
-            q0 = np.append(np.log(shape0 + [amp0]), C_bg0)
+            q_lower = np.log(lower + [amp0 * 1e-8])
+            q_upper = np.log(upper + [amp0 * 1e8])
+            q0 = np.log(shape0 + [amp0])
             q0 = np.clip(q0, q_lower + 1e-6, q_upper - 1e-6)
             try:
                 q_opt, _ = curve_fit(
@@ -193,7 +203,7 @@ def fit_analytical_models(t_obs, C_obs):
                 best = (cost, q_opt, q_lower, q_upper)
 
         cost, q_opt, q_lower, q_upper = best
-        fitted, C_bg = np.exp(q_opt[:-1]), q_opt[-1]
+        fitted = np.exp(q_opt)
         model_params = to_model(*fitted)
 
         at_bound = [
@@ -201,18 +211,15 @@ def fit_analytical_models(t_obs, C_obs):
             for p, q, lo, hi in zip(names, q_opt, q_lower, q_upper)
             if q - lo < 1e-3 or hi - q < 1e-3
         ]
-        if C_bg_max - C_bg < 1e-3 * C_bg_max:
-            at_bound.append("C_bg")
 
-        def predict(t, func=func, model_params=model_params, C_bg=C_bg):
-            return func(t, *model_params) + C_bg
+        def predict(t, func=func, model_params=model_params):
+            return func(t, *model_params)
 
         params = dict(zip(names, fitted))
         model_names = list(inspect.signature(func).parameters)[1:]  # skip t
         params.update(
             (k, v) for k, v in zip(model_names, model_params) if k not in params
         )
-        params["C_bg"] = C_bg
         results.append(
             {
                 "model": name,
@@ -289,7 +296,7 @@ def plot_tracer_data(tracer_data):
     plt.close()
 
 
-def plot_fitted_curves(t_obs, C_obs, fits, well):
+def plot_fitted_curves(t_obs, C_obs, fits, well, C_bg):
     _, C_max = robust_peak(t_obs, C_obs)
 
     plt.figure(figsize=(10, 6))
@@ -299,7 +306,7 @@ def plot_fitted_curves(t_obs, C_obs, fits, well):
         color="black",
         s=15,
         alpha=0.7,
-        label="Measured Field Data",
+        label=f"Measured Field Data (background {C_bg:.3g} ppb removed)",
     )
 
     t_end = max(PLOT_T_END_DAYS, np.max(t_obs))
