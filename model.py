@@ -8,6 +8,8 @@ from scipy.signal import medfilt
 
 WELLS = ["b", "c", "d", "e", "f"]
 INJECTOR = "a1"
+EXCLUDED_FROM_TENSOR = ["e"]    # no usable breakthrough curve
+MAX_CONDITION = 10.0          # larger: the well directions cannot resolve a tensor
 FIG_DIR = "figures"
 
 # TABLE 1: injector A1 -> producer: (dz [m], dP [MPa])
@@ -59,14 +61,40 @@ def main():
     print(f"\nDarcy's law with dP from Table 1, mu = {MU:g} Pa s")
     print(f"{'well':>4} {'model':>44} {'L (m)':>6} {'t_adv (d)':>9} {'v (m/d)':>8} "
           f"{'k (m2)':>9} {'k (mD)':>8} {'h_cubic (um)':>12}")
+    k_by_model = {}
     for w, fits in all_fits.items():
         dz, dP = TABLE_1[w]
         for name, fit in fits.items():
             L = fit["params"].get("L", dz)
             t_adv = list(fit["params"].values())[0]      # t_c, t_m or t_b
             v, k, h = permeability(L, t_adv, dP)
+            k_by_model.setdefault(name, {})[w] = k
             print(f"{w:>4} {name:>44} {L:6.0f} {t_adv:9.1f} {v * DAY:8.2f} "
                   f"{k:9.2e} {k / MILLIDARCY:8.0f} {h * 1e6:12.2f}")
+
+    # Anisotropy: well E has no usable breakthrough curve, so it is left out.
+    tensor_wells = [w for w in WELLS if w not in EXCLUDED_FROM_TENSOR]
+    e1, e2, normal = fault_plane(geometry)
+    print(f"\nPermeability tensor in the fault plane (wells {', '.join(tensor_wells).upper()}), "
+          f"fault dip {np.degrees(np.arccos(abs(normal[2]))):.0f} deg")
+    for w in tensor_wells:
+        d = geometry[w]["direction"]
+        print(f"  A1 -> {w.upper()}: {np.degrees(np.arctan2(d @ e1, d @ e2)):5.1f} deg from down-dip "
+              f"in the plane, {np.degrees(np.arcsin(abs(d @ normal))):4.1f} deg out of the plane")
+    print(f"{'model':>44} {'k_max (mD)':>10} {'k_min (mD)':>10} {'ratio':>6} "
+          f"{'k_max azimuth/plunge (deg)':>27} {'cond':>6} {'misfit':>7}")
+    for name, k_by_well in k_by_model.items():
+        t = permeability_tensor([k_by_well[w] for w in tensor_wells],
+                                [geometry[w]["direction"] for w in tensor_wells], e1, e2)
+        if t["cond"] > MAX_CONDITION or t["k_min"] <= 0:
+            # The directions are too close together: only the down-dip value is constrained.
+            k_dip = np.exp(np.mean(np.log([k_by_well[w] for w in tensor_wells])))
+            print(f"{name:>44}  not resolvable (cond {t['cond']:.0f}); "
+                  f"down-dip k = {k_dip / MILLIDARCY:.0f} mD (geometric mean)")
+            continue
+        print(f"{name:>44} {t['k_max'] / MILLIDARCY:10.0f} {t['k_min'] / MILLIDARCY:10.0f} "
+              f"{t['k_max'] / t['k_min']:6.1f} {t['azimuth']:16.0f} / {t['plunge']:<8.0f} "
+              f"{t['cond']:6.1f} {t['misfit']:7.2f}")
 
     plt.show()
 
@@ -354,6 +382,50 @@ def permeability(L, t_adv, dP):
     v = L / (t_adv * DAY)
     k = MU * v * L / (dP * 1e6)
     return v, k, np.sqrt(12.0 * k)
+
+
+# func: anisotropy.
+def fault_plane(geometry):
+    """Plane through the well-fault intersection points (least squares).
+
+    Returns the strike direction e1 (horizontal), the down-dip direction e2
+    and the plane normal, all unit vectors.
+    """
+    pts = np.array([g["point"] for g in geometry.values()])
+    normal = np.linalg.svd(pts - pts.mean(axis=0))[2][-1]
+    e1 = np.cross([0.0, 0.0, 1.0], normal)
+    e1 /= np.linalg.norm(e1)
+    e2 = np.cross(normal, e1)
+    if e2[2] > 0:               # point e2 down-dip
+        e2 = -e2
+    return e1, e2, normal
+
+
+def permeability_tensor(k, directions, e1, e2):
+    """Fit a 2-D permeability tensor in the fault plane.
+
+    Each well pair gives the permeability k_i along its direction n_i,
+    projected onto the fault plane: k_i = n_i^T K n_i. With
+    K = [[a, b], [b, c]] this is linear in (a, b, c) and is solved by least
+    squares. Needs at least three directions that are not parallel.
+    """
+    n = np.array([[d @ e1, d @ e2] for d in directions])
+    n /= np.linalg.norm(n, axis=1)[:, None]
+    A = np.column_stack([n[:, 0] ** 2, 2.0 * n[:, 0] * n[:, 1], n[:, 1] ** 2])
+    k = np.asarray(k)
+    # Solve in relative terms so that every well counts equally.
+    (a, b, c), *_ = np.linalg.lstsq(A / k[:, None], np.ones_like(k), rcond=None)
+    K = np.array([[a, b], [b, c]])
+
+    values, vectors = np.linalg.eigh(K)
+    v_max = vectors[0, 1] * e1 + vectors[1, 1] * e2          # 3-D direction of k_max
+    if v_max[2] > 0:
+        v_max = -v_max
+    azimuth = np.degrees(np.arctan2(v_max[0], v_max[1])) % 360.0
+    plunge = np.degrees(np.arcsin(-v_max[2]))
+    misfit = np.sqrt(np.mean((A @ [a, b, c] / k - 1.0) ** 2))   # relative RMS
+    return {"K": K, "k_max": values[1], "k_min": values[0], "azimuth": azimuth,
+            "plunge": plunge, "cond": np.linalg.cond(A), "misfit": misfit}
 
 
 # Draw graphs for time (days) vs C/Cmax for every well, in the style of Figure 1.
