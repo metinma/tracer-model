@@ -1,13 +1,16 @@
+import csv
 import inspect
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+from scipy.ndimage import median_filter
 from scipy.optimize import curve_fit
 
 INJECTOR = "a1"
 PRODUCERS = ["b", "c", "d", "e", "f"]
 
+# Project Table 1: distance and pressure difference from A1 to each well
 WELL_PARAMS = {
     "b": {"dist_m": 750.0, "delta_p_mpa": 7.0},
     "f": {"dist_m": 1000.0, "delta_p_mpa": 8.0},
@@ -15,6 +18,13 @@ WELL_PARAMS = {
     "d": {"dist_m": 1500.0, "delta_p_mpa": 10.0},
     "c": {"dist_m": 1600.0, "delta_p_mpa": 11.0},
 }
+
+# Assumed fluid and rock properties (not in the data)
+MU = 1.5e-4  # Pa s, water viscosity at ~180 C
+D_M = 2e-9  # m2/s, molecular diffusion coefficient of the tracer in hot water
+PHI_M = 0.005  # matrix porosity (project Table 2)
+AT_RATIO = 0.2  # alpha_T / alpha_L (project Table 2)
+DAY = 86400.0  # s
 
 PLOT_T_END_DAYS = 1000.0
 
@@ -33,55 +43,62 @@ def main():
     plot_3d_spatial_data(coordinates)
     plot_tracer_data(tracer_data)
 
-    print("Well distances from injector (m)")
-    for well, dist in compute_well_distances(coordinates).items():
-        print(f"  {well}: {dist:.1f}")
-
-    all_fits = []
+    rows = []
     for well in PRODUCERS:
         t_obs, C_raw = tracer_data[well]
         C_bg = estimate_background(C_raw)
         C_obs = np.clip(C_raw - C_bg, 0.0, None)
         fits = fit_analytical_models(t_obs, C_obs)
         plot_fitted_curves(t_obs, C_obs, fits, well, C_bg)
-        print(f"  {well}: background removed = {C_bg:.3g} ppb")
-        all_fits += [dict(fit, well=well) for fit in fits]
+        for fit in fits:
+            rows.append({"well": well, "model": fit["model"], **summary_row(fit, well)})
 
-    print_fit_summary(all_fits)
+    print_table(rows)
+    write_csv(rows, "./fits/summary.csv")
+    print_permeability_tensors(rows, well_directions(coordinates))
 
 
-def sauty_uniform(t, t_c, Pe, C_max):
+# --- Analytical models (t in days) ------------------------------------------
+
+
+def _positive(t):
     t = np.asarray(t, dtype=float)
-    t_R = np.where(t > 0, t, np.nan) / t_c  # dimensionless time
+    return np.where(t > 0, t, np.nan)
 
-    t_Rmax = np.sqrt(1 + 4 * Pe ** (-2)) - 2 / Pe  # Eq. 44
+
+def sauty_uniform(t, t_c, Pe, C0):
+    """Sauty (1980) Eq. 42-44: slug injection, 2-D uniform flow, on the flow axis."""
+    t_R = _positive(t) / t_c
+    t_Rmax = np.sqrt(1 + 4 / Pe**2) - 2 / Pe  # Eq. 44
     K = t_Rmax * np.exp(Pe * (1 - t_Rmax) ** 2 / (4 * t_Rmax))  # Eq. 43
-
-    C_R = K / t_R * np.exp(-Pe * (1 - t_R) ** 2 / (4 * t_R))  # Eq. 42
-    return np.nan_to_num(C_R * C_max)
+    return np.nan_to_num(C0 * K / t_R * np.exp(-Pe * (1 - t_R) ** 2 / (4 * t_R)))
 
 
 def bullivant_single_fracture(t, t_m, w, L):
-    t = np.asarray(t, dtype=float)
-    t_v = np.where(t > 0, t, np.nan)
-
-    exponent = -w * (t_v - t_m) ** 2 / (4 * t_m * t_v)
-    return np.nan_to_num(L * 2 * t_m / t_v**1.5 * np.exp(exponent))
+    """Bullivant & O'Sullivan (1989) Eq. 8: single fracture, Taylor dispersion."""
+    t = _positive(t)
+    return np.nan_to_num(L * 2 * t_m / t**1.5 * np.exp(-w * (t - t_m) ** 2 / (4 * t_m * t)))
 
 
 def bullivant_fracture_matrix(t, t_b, w, L):
-    t = np.asarray(t, dtype=float)
-    dt = np.where(t > t_b, t - t_b, np.nan)  # time after breakthrough
-
+    """Bullivant & O'Sullivan (1989) Eq. 17: fracture with matrix diffusion."""
+    dt = _positive(np.asarray(t, dtype=float) - t_b)
     return np.nan_to_num(L / dt**1.5 * np.exp(-t_b / (w * dt)))
 
 
 def houseworth_fracture_matrix(t, t_a, beta, gamma, M):
-    t = np.asarray(t, dtype=float)
-    theta = np.where(t > t_a, (t - t_a) / t_a, np.nan)
+    """Houseworth et al. (2013) Eq. 57, release in the fracture (eta_0 = 0).
 
-    exponent = -beta / (4 * theta) - gamma * theta / 4
-    return np.nan_to_num(M * np.sqrt(beta / np.pi) / 4 / theta**1.5 * np.exp(exponent))
+    With no matrix flow along the fracture and theta = (t - t_a)/t_a, Eq. 57
+    becomes M theta^-1.5 exp(-beta/(4 theta) - gamma theta/4), where
+    beta = xi/Pe (matrix diffusion) and gamma = Pe V^2 xi (cross-flow through
+    the matrix). With gamma = 0 it is Bullivant's Eq. 17.
+    """
+    theta = _positive(np.asarray(t, dtype=float) - t_a) / t_a
+    return np.nan_to_num(M * theta**-1.5 * np.exp(-beta / (4 * theta) - gamma * theta / 4))
+
+
+# --- Data preparation --------------------------------------------------------
 
 
 def estimate_background(C_obs):
@@ -95,13 +112,21 @@ def estimate_background(C_obs):
     return min(np.median(C_obs[:n]), np.median(C_obs[-n:]))
 
 
-def robust_peak(t_obs, C_obs, window=5):
-    if len(C_obs) < window:
-        i = np.argmax(C_obs)
-        return t_obs[i], C_obs[i]
-    smooth = np.median(np.lib.stride_tricks.sliding_window_view(C_obs, window), axis=1)
-    i = np.argmax(smooth) + window // 2
-    return t_obs[i], smooth[i - window // 2]
+def robust_peak(t_obs, C_obs):
+    smooth = median_filter(C_obs, size=5, mode="nearest")
+    i = np.argmax(smooth)
+    return t_obs[i], smooth[i]
+
+
+def first_arrival(t_obs, C_obs, frac=0.05):
+    """Last time before the peak at which the smoothed data are below frac * peak.
+
+    A wide median window keeps isolated low or high samples from moving it.
+    """
+    t_peak, C_peak = robust_peak(t_obs, C_obs)
+    smooth = median_filter(C_obs, size=21, mode="nearest")
+    before = (t_obs < t_peak) & (smooth < frac * C_peak)
+    return t_obs[before].max() if before.any() else t_obs[0]
 
 
 def sampling_weights(t_obs):
@@ -110,131 +135,185 @@ def sampling_weights(t_obs):
     return 1 / np.sqrt(dt / np.mean(dt))
 
 
-def _fm_to_model(t_b, dt_p, L):
-    return t_b, (2 / 3) * t_b / dt_p, L
+# --- Fitting -----------------------------------------------------------------
 
 
 def fit_analytical_models(t_obs, C_obs):
-    t_peak, C_peak = robust_peak(t_obs, C_obs)
-    t_max = np.max(t_obs)
-    sigma = sampling_weights(t_obs)
-    weights = 1 / sigma**2
+    """Fit every model. Times of the fracture-matrix models are fixed.
 
-    arrival_fracs = [0.05, 0.2, 0.4, 0.6, 0.8, 0.9]
+    In both fracture-matrix models no tracer arrives before the advective time
+    t_b (t_a), so it is fixed at the observed first arrival. Left free it slides
+    to ~0 and both models turn into the single-fracture curve.
+    """
+    t_peak, _ = robust_peak(t_obs, C_obs)
+    t_arr = first_arrival(t_obs, C_obs)
+    T = 10 * np.max(t_obs)
+
     sauty_starts = [[f * t_peak, pe] for f in (1.0, 1.5) for pe in (3.0, 10.0, 30.0)]
-    sf_starts = [
-        [f * t_peak, 6 * f / (f**2 - 1)]  # B&O Eq. 9 with t_m = f t_peak
-        for f in (1.05, 1.2, 1.5, 2.0)
-    ]
-    fm_starts = [[f * t_peak, (1 - f) * t_peak] for f in arrival_fracs]
-    hw_starts = [
-        [f * t_peak, 6 * (1 - f) / f, gamma]  # peak at theta = beta/6
-        for f in arrival_fracs
-        for gamma in (1e-3, 0.1)
-    ]
-
-    models_config = {
-        "sauty_uniform": (
-            sauty_uniform,
-            ["t_c", "Pe", "C_max"],
-            sauty_starts,
-            [0.01, 0.01],
-            [10 * t_max, 1e4],
-            None,
-        ),
+    models = {
+        # name: (function, fixed parameters, starts, lower, upper) - amplitude excluded
+        "sauty_uniform": (sauty_uniform, {}, sauty_starts, [1, 1], [T, 1e4]),
         "bullivant_single_fracture": (
             bullivant_single_fracture,
-            ["t_m", "w", "L"],
-            sf_starts,
-            [0.01, 0.01],
-            [10 * t_max, 1e4],
-            None,
+            {},
+            [[f * t_peak, 6 * f / (f**2 - 1)] for f in (1.05, 1.2, 1.5, 2.0)],  # Eq. 9
+            [1, 0.1],
+            [T, 1e4],
         ),
         "bullivant_fracture_matrix": (
             bullivant_fracture_matrix,
-            ["t_b", "dt_p", "L"],
-            fm_starts,
-            [0.01, 0.01],
-            [t_max, 2 * t_max],
-            _fm_to_model,
+            {"t_b": t_arr},
+            [[2 / 3 * t_arr / (t_peak - t_arr)]],  # Eq. 18
+            [1e-4],
+            [1e4],
         ),
         "houseworth_fracture_matrix": (
             houseworth_fracture_matrix,
-            ["t_a", "beta", "gamma", "M"],
-            hw_starts,
-            [0.01, 1e-4, 1e-8],
-            [t_max, 1e4, 1e4],
-            None,
+            {"t_a": t_arr},
+            [[6 * (t_peak - t_arr) / t_arr, g] for g in (1e-3, 0.1, 1.0, 10.0, 100.0)],
+            [1e-4, 1e-6],
+            [1e4, 1e3],
         ),
     }
+    return [
+        fit_model(name, *config, t_obs, C_obs, t_peak)
+        for name, config in models.items()
+    ]
 
-    results = []
-    for name, (func, names, starts, lower, upper, to_model) in models_config.items():
-        to_model = to_model or (lambda *p: p)
 
-        def fit_func(t, *q, func=func, to_model=to_model):
-            return func(t, *to_model(*np.exp(q)))
+def fit_model(name, func, fixed, starts, lower, upper, t_obs, C_obs, t_peak):
+    """Weighted least squares in log-parameters, best of several starts."""
+    free = [n for n in list(inspect.signature(func).parameters)[1:] if n not in fixed]
+    sigma = sampling_weights(t_obs)
 
-        best = None
-        for shape0 in starts:
-            # Amplitude guess: make the initial curve pass through the peak
-            shape_at_peak = func(np.array([t_peak]), *to_model(*shape0, 1.0))[0]
-            amp0 = C_peak / shape_at_peak if shape_at_peak > 0 else C_peak
+    def model(t, *q):
+        return func(t, **fixed, **dict(zip(free, np.exp(q))))
 
-            q_lower = np.log(lower + [amp0 * 1e-8])
-            q_upper = np.log(upper + [amp0 * 1e8])
-            q0 = np.log(shape0 + [amp0])
-            q0 = np.clip(q0, q_lower + 1e-6, q_upper - 1e-6)
-            try:
-                q_opt, _ = curve_fit(
-                    fit_func,
-                    t_obs,
-                    C_obs,
-                    p0=q0,
-                    sigma=sigma,
-                    bounds=(q_lower, q_upper),
-                    method="trf",
-                    maxfev=20000,
-                )
-            except RuntimeError:
-                continue  # this start did not converge
-            cost = np.sum(weights * (C_obs - fit_func(t_obs, *q_opt)) ** 2)
-            if best is None or cost < best[0]:
-                best = (cost, q_opt, q_lower, q_upper)
+    best = None
+    for start in starts:
+        shape = func(np.array([t_peak]), **fixed, **dict(zip(free, start + [1.0])))[0]
+        amp0 = np.max(C_obs) / shape if shape > 0 else 1.0
+        lo = np.log(lower + [amp0 * 1e-6])
+        hi = np.log(upper + [amp0 * 1e6])
+        q0 = np.clip(np.log(start + [amp0]), lo + 1e-6, hi - 1e-6)
+        try:
+            q, cov = curve_fit(
+                model, t_obs, C_obs, p0=q0, sigma=sigma, bounds=(lo, hi), maxfev=20000
+            )
+        except RuntimeError:
+            continue  # this start did not converge
+        cost = np.sum((C_obs - model(t_obs, *q)) ** 2 / sigma**2)
+        if best is None or cost < best[0]:
+            best = (cost, q, cov, lo, hi)
 
-        cost, q_opt, q_lower, q_upper = best
-        fitted = np.exp(q_opt)
-        model_params = to_model(*fitted)
+    cost, q, cov, lo, hi = best
+    with np.errstate(over="ignore"):
+        factor = np.exp(np.sqrt(np.diag(cov)))
+    params = {**fixed, **dict(zip(free, np.exp(q)))}
+    return {
+        "model": name,
+        "predict": lambda t: func(t, **params),
+        "params": params,
+        # multiplicative 1-sigma uncertainty of each fitted parameter
+        "factor": dict(zip(free, factor)),
+        "rmse": np.sqrt(cost / np.sum(1 / sigma**2)),
+        "at_bound": [n for n, a, b, c in zip(free, q, lo, hi) if a - b < 1e-3 or c - a < 1e-3],
+    }
 
-        at_bound = [
-            p
-            for p, q, lo, hi in zip(names, q_opt, q_lower, q_upper)
-            if q - lo < 1e-3 or hi - q < 1e-3
-        ]
 
-        def predict(t, func=func, model_params=model_params):
-            return func(t, *model_params)
+# --- Physical parameters -----------------------------------------------------
 
-        params = dict(zip(names, fitted))
-        model_names = list(inspect.signature(func).parameters)[1:]  # skip t
-        params.update(
-            (k, v) for k, v in zip(model_names, model_params) if k not in params
+
+def summary_row(fit, well):
+    """Velocity, dispersivity, aperture and permeability from the fitted parameters."""
+    R = WELL_PARAMS[well]["dist_m"]
+    dP = WELL_PARAMS[well]["delta_p_mpa"] * 1e6
+    p, name = fit["params"], fit["model"]
+    row = {"rmse_ppb": fit["rmse"], "at_bound": " ".join(fit["at_bound"])}
+
+    if name.startswith("sauty"):
+        t_adv, t_key = p["t_c"], "t_c"
+        row["alpha_L_m"] = R / p["Pe"]
+        row["alpha_T_m"] = AT_RATIO * row["alpha_L_m"]
+    elif name == "bullivant_single_fracture":
+        t_adv, t_key = p["t_m"], "t_m"
+        u = R / (t_adv * DAY)
+        D_Tr = R**2 / (p["w"] * t_adv * DAY)  # Eq. 11
+        row["alpha_L_m"] = R / p["w"]
+        row["aperture_m"] = 2 / u * np.sqrt(105 / 2 * D_Tr * D_M)  # Eq. 4
+    elif name == "bullivant_fracture_matrix":
+        t_adv, t_key = p["t_b"], "t_b"
+        # w = (q/RA) a^2/(D_m n_m^2) and q/RA = 1/t_b (Eq. 17)
+        row["aperture_m"] = PHI_M * np.sqrt(p["w"] * t_adv * DAY * D_M)
+    else:
+        t_adv, t_key = p["t_a"], "t_a"
+        # beta = xi/Pe = t_a D_m (2 phi_m / b)^2, gamma = t_a v_mx^2 / D_m
+        row["aperture_m"] = 2 * PHI_M * np.sqrt(t_adv * DAY * D_M / p["beta"])
+        row["v_matrix_m_day"] = np.sqrt(p["gamma"] * D_M / (t_adv * DAY)) * DAY
+
+    v = R / (t_adv * DAY)  # m/s
+    k = MU * v * R / dP  # Darcy along the well pair
+    row["t_adv_day"] = t_adv
+    row["t_adv_factor"] = fit["factor"].get(t_key, 1.0)  # 1.0: fixed at first arrival
+    row["v_m_day"] = v * DAY
+    row["k_m2"] = k
+    row["h_cubic_m"] = np.sqrt(12 * k)  # cubic law, k = h^2/12
+    return row
+
+
+def well_directions(coordinates):
+    """Horizontal unit vector from the injector bottom to each producer bottom."""
+    inj = coordinates[INJECTOR][-1]
+    dirs = {}
+    for well in PRODUCERS:
+        d = coordinates[well][-1][:2] - inj[:2]
+        dirs[well] = d / np.linalg.norm(d)
+    return dirs
+
+
+def permeability_tensor(k_by_well, dirs):
+    """Least-squares 2-D tensor from directional values k_n = n.K.n."""
+    A = [[n[0] ** 2, 2 * n[0] * n[1], n[1] ** 2] for n in (dirs[w] for w in k_by_well)]
+    kxx, kxy, kyy = np.linalg.lstsq(np.array(A), np.array(list(k_by_well.values())), rcond=None)[0]
+    eigval, eigvec = np.linalg.eigh([[kxx, kxy], [kxy, kyy]])
+    azimuth = np.degrees(np.arctan2(eigvec[0, 1], eigvec[1, 1])) % 180  # from north (+y)
+    return eigval[1], eigval[0], azimuth
+
+
+# --- Output ------------------------------------------------------------------
+
+
+def print_table(rows):
+    print(
+        f"{'well':<5}{'model':<28}{'RMSE':>7}{'t_adv(d)':>13}{'v(m/d)':>8}"
+        f"{'aL(m)':>8}{'aperture':>10}{'k(m2)':>10}{'h_cubic':>9}  at bound"
+    )
+    for r in rows:
+        print(
+            f"{r['well'].upper():<5}{r['model']:<28}{r['rmse_ppb']:>7.3f}"
+            f"{r['t_adv_day']:>7.0f} x{r['t_adv_factor']:<5.3g}{r['v_m_day']:>8.2f}"
+            f"{r.get('alpha_L_m', np.nan):>8.1f}{r.get('aperture_m', np.nan):>10.2e}"
+            f"{r['k_m2']:>10.2e}{r['h_cubic_m']:>9.2e}  {r['at_bound']}"
         )
-        results.append(
-            {
-                "model": name,
-                "predict": predict,
-                "params": params,
-                "rmse": np.sqrt(cost / np.sum(weights)),  # time-weighted
-                "at_bound": at_bound,
-            }
+
+
+def write_csv(rows, path):
+    keys = list(dict.fromkeys(k for r in rows for k in r))
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=keys)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def print_permeability_tensors(rows, dirs):
+    print("\nHorizontal permeability tensor (from k along each well pair)")
+    for model in MODEL_STYLES:
+        k = {r["well"]: r["k_m2"] for r in rows if r["model"] == model}
+        k_max, k_min, azimuth = permeability_tensor(k, dirs)
+        print(
+            f"  {model:<28} k_max={k_max:.2e}  k_min={k_min:.2e}  "
+            f"ratio={k_max / k_min:.1f}  k_max azimuth={azimuth:.0f} deg"
         )
-    return results
-
-
-def print_fit_summary(all_fits):
-    for fit in all_fits:
-        print(f"{fit['well'].upper()}  {fit['model']:<28} RMSE={fit['rmse']:.3f}")
 
 
 def import_tracer_data(data_dir):
@@ -252,13 +331,6 @@ def import_coordinates(data_dir):
     return {
         file.stem: np.loadtxt(file, skiprows=1, usecols=(0, 1, 2), ndmin=2)
         for file in sorted(Path(data_dir).glob("*.txt"))
-    }
-
-
-def compute_well_distances(coordinates):
-    inj_bottom = coordinates[INJECTOR][-1]
-    return {
-        well: np.linalg.norm(coordinates[well][-1] - inj_bottom) for well in PRODUCERS
     }
 
 
