@@ -455,7 +455,8 @@ def plot_fits(well, btc, fits):
     t_fine = np.linspace(0.0, 1000.0, 2001)
 
     fig, ax = plt.subplots(figsize=(7, 4.5))
-    ax.plot(t, y, "o", ms=4, mfc="none", color="k", label="Measurement")
+    nonzero = y > 0                     # zero values are fitted but not plotted
+    ax.plot(t[nonzero], y[nonzero], "o", ms=4, mfc="none", color="k", label="Measurement")
     for name in STYLES:
         fit = fits[name]
         ax.plot(t_fine, fit["func"](t_fine, *fit["params"].values()),
