@@ -46,57 +46,93 @@ def main():
     geometry = geometric_parameters(wells, fault)
     plot_field(wells, fault, geometry)
 
-    all_fits = {}
-    print(f"\n{'well':>4} {'model':>44} {'parameters':>40} {'RMSE':>6}")
+    rows, k_by_model = [], {}
     for w in WELLS:
         btc = process_btc(*load_btc(w))
         fits = fit_models(btc, TABLE_1[w][0])
-        for name, fit in fits.items():
-            p = ", ".join(f"{k}={v:.3g}" for k, v in fit["params"].items())
-            print(f"{w:>4} {name:>44} {p:>40} {fit['rmse']:6.3f}")
         plot_fits(w, btc, fits)
-        all_fits[w] = fits
-
-    # L is the model's fitted path length where it has one, otherwise dz (Table 1).
-    print(f"\nDarcy's law with dP from Table 1, mu = {MU:g} Pa s")
-    print(f"{'well':>4} {'model':>44} {'L (m)':>6} {'t_adv (d)':>9} {'v (m/d)':>8} "
-          f"{'k (m2)':>9} {'k (mD)':>8} {'h_cubic (um)':>12}")
-    k_by_model = {}
-    for w, fits in all_fits.items():
         dz, dP = TABLE_1[w]
         for name, fit in fits.items():
-            L = fit["params"].get("L", dz)
-            t_adv = list(fit["params"].values())[0]      # t_c, t_m or t_b
-            v, k, h = permeability(L, t_adv, dP)
+            p = fit["params"]
+            L = p.get("L", dz)              # fitted path length, otherwise dz (Table 1)
+            t_adv = list(p.values())[0]     # t_c, t_m or t_b
+            v, k, h_cubic = permeability(L, t_adv, dP)
             k_by_model.setdefault(name, {})[w] = k
-            print(f"{w:>4} {name:>44} {L:6.0f} {t_adv:9.1f} {v * DAY:8.2f} "
-                  f"{k:9.2e} {k / MILLIDARCY:8.0f} {h * 1e6:12.2f}")
+            values = dict(FIXED_VALUES[name])
+            values.update({key: (val, "*") for key, val in p.items() if key in ("L", "h")})
+            values.setdefault("L", (L, ""))
+            rows.append([w.upper(), SHORT_NAMES[name],
+                         cell(values, "L", "{:.0f}"), f"{v * DAY:.2f}",
+                         cell(values, "alpha_L", "{:.0f}"), cell(values, "alpha_T", "{:.0f}"),
+                         cell(values, "phi_m", "{:.3f}"), cell(values, "h", "{:.3f}", 1e3),
+                         f"{k / MILLIDARCY:.0f}", f"{h_cubic * 1e6:.1f}", "-", f"{fit['rmse']:.3f}"])
 
-    # Anisotropy: well E has no usable breakthrough curve, so it is left out.
+    # Anisotropy in the fault plane; well E has no usable breakthrough curve.
     tensor_wells = [w for w in WELLS if w not in EXCLUDED_FROM_TENSOR]
-    e1, e2, normal = fault_plane(geometry)
-    print(f"\nPermeability tensor in the fault plane (wells {', '.join(tensor_wells).upper()}), "
-          f"fault dip {np.degrees(np.arccos(abs(normal[2]))):.0f} deg")
-    for w in tensor_wells:
-        d = geometry[w]["direction"]
-        print(f"  A1 -> {w.upper()}: {np.degrees(np.arctan2(d @ e1, d @ e2)):5.1f} deg from down-dip "
-              f"in the plane, {np.degrees(np.arcsin(abs(d @ normal))):4.1f} deg out of the plane")
-    print(f"{'model':>44} {'k_max (mD)':>10} {'k_min (mD)':>10} {'ratio':>6} "
-          f"{'k_max azimuth/plunge (deg)':>27} {'cond':>6} {'misfit':>7}")
+    e1, e2, _ = fault_plane(geometry)
     for name, k_by_well in k_by_model.items():
-        t = permeability_tensor([k_by_well[w] for w in tensor_wells],
-                                [geometry[w]["direction"] for w in tensor_wells], e1, e2)
+        k = [k_by_well[w] for w in tensor_wells]
+        t = permeability_tensor(k, [geometry[w]["direction"] for w in tensor_wells], e1, e2)
         if t["cond"] > MAX_CONDITION or t["k_min"] <= 0:
-            # The directions are too close together: only the down-dip value is constrained.
-            k_dip = np.exp(np.mean(np.log([k_by_well[w] for w in tensor_wells])))
-            print(f"{name:>44}  not resolvable (cond {t['cond']:.0f}); "
-                  f"down-dip k = {k_dip / MILLIDARCY:.0f} mD (geometric mean)")
-            continue
-        print(f"{name:>44} {t['k_max'] / MILLIDARCY:10.0f} {t['k_min'] / MILLIDARCY:10.0f} "
-              f"{t['k_max'] / t['k_min']:6.1f} {t['azimuth']:16.0f} / {t['plunge']:<8.0f} "
-              f"{t['cond']:6.1f} {t['misfit']:7.2f}")
+            # Directions too close together: only the down-dip value is constrained.
+            k_text = f"{np.exp(np.mean(np.log(k))) / MILLIDARCY:.0f}"
+            anisotropy = f"n/r (cond {t['cond']:.0f})"
+        else:
+            k_text = f"{t['k_max'] / MILLIDARCY:.0f}/{t['k_min'] / MILLIDARCY:.0f}"
+            anisotropy = f"{t['k_max'] / t['k_min']:.1f} at {t['azimuth']:.0f}/{t['plunge']:.0f}"
+        rows.append(["".join(tensor_wells).upper(), SHORT_NAMES[name], "-", "-", "-", "-", "-",
+                     "-", k_text, "-", anisotropy, "-"])
+
+    header = ["Well", "Model", "L (m)", "v (m/d)", "aL (m)", "aT (m)", "phi_m", "h (mm)",
+              "k (mD)", "h_cubic (um)", "k_max/k_min", "RMSE"]
+    print_table(header, rows)
+    print("* fitted; other aL, aT, phi_m and h values are fixed from Table 2. "
+          f"k from Darcy's law with dP from Table 1 and mu = {MU:g} Pa s; h_cubic from k = h^2/12.\n"
+          f"Rows {''.join(tensor_wells).upper()}: k along dip (geometric mean) when the tensor is "
+          "not resolvable (n/r), else k_max/k_min with the k_max azimuth/plunge.")
 
     plt.show()
+
+
+# Values held fixed from Table 2 for each model, as (value, marker).
+FIXED_VALUES = {
+    "Eq. 23": {"alpha_L": (TABLE_2["sauty"]["alpha_L"], "")},
+    "Uniform porous - Sauty (1980)": {"alpha_L": (TABLE_2["sauty"]["alpha_L"], ""),
+                                      "alpha_T": (TABLE_2["sauty"]["alpha_T"], "")},
+    "Single fracture - Bullivant & Sul.(1989)": {
+        "alpha_L": (TABLE_2["sauty"]["alpha_L"], ""),
+        "h": (TABLE_2["bullivant_single_fracture"]["h"], "")},
+    "Fracture-matrix - Bullivant & Sul. (1989)": {
+        "phi_m": (TABLE_2["bullivant_fracture_matrix"]["phi_matrix"], "")},
+    "Fracture-matrix - Houseworth et al. (2013)": {
+        "phi_m": (TABLE_2["bullivant_fracture_matrix"]["phi_matrix"], ""),
+        "h": (TABLE_2["houseworth"]["h"], "")},
+}
+
+SHORT_NAMES = {
+    "Eq. 23": "Sauty 1-D (Eq. 23)",
+    "Uniform porous - Sauty (1980)": "Sauty 2-D (Eq. 39-42)",
+    "Single fracture - Bullivant & Sul.(1989)": "B&O single fracture",
+    "Fracture-matrix - Bullivant & Sul. (1989)": "B&O fracture-matrix",
+    "Fracture-matrix - Houseworth et al. (2013)": "Houseworth",
+}
+
+
+def cell(values, key, fmt, scale=1.0):
+    """Format a reported value, '-' if the model does not have it."""
+    if key not in values:
+        return "-"
+    value, marker = values[key]
+    return fmt.format(value * scale) + marker
+
+
+def print_table(header, rows):
+    widths = [max(len(str(r[i])) for r in [header] + rows) for i in range(len(header))]
+    line = "  ".join(h.rjust(n) for h, n in zip(header, widths))
+    print(line)
+    print("-" * len(line))
+    for r in rows:
+        print("  ".join(str(c).rjust(n) for c, n in zip(r, widths)))
 
 
 # func: load btc data.
