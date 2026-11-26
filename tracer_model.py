@@ -30,7 +30,6 @@ PLOT_T_END_DAYS = 1000.0
 
 MODEL_STYLES = {
     "sauty_uniform": ("blue", "-"),
-    "sauty_radial": ("red", "-"),
     "bullivant_single_fracture": ("green", "--"),
     "bullivant_fracture_matrix": ("orange", "-."),
     "houseworth_fracture_matrix": ("purple", ":"),
@@ -73,17 +72,6 @@ def sauty_uniform(t, t_c, Pe, C0):
     t_Rmax = np.sqrt(1 + 4 / Pe**2) - 2 / Pe  # Eq. 44
     K = t_Rmax * np.exp(Pe * (1 - t_Rmax) ** 2 / (4 * t_Rmax))  # Eq. 43
     return np.nan_to_num(C0 * K / t_R * np.exp(-Pe * (1 - t_R) ** 2 / (4 * t_R)))
-
-
-def sauty_radial(t, t_c, Pe, C0):
-    """Sauty (1980) Eq. 52: diverging radial flow from the injector.
-
-    Eq. 52 is for continuous injection; the slug response is its time
-    derivative, C ~ t_R^-1.75 (0.75 + 0.25 t_R) exp(-g^2).
-    """
-    t_R = _positive(t) / t_c
-    g = np.sqrt(3 * Pe) * (1 - t_R) / (4 * t_R**0.75)
-    return np.nan_to_num(C0 * t_R**-1.75 * (0.75 + 0.25 * t_R) * np.exp(-(g**2)))
 
 
 def bullivant_single_fracture(t, t_m, w, L):
@@ -165,7 +153,6 @@ def fit_analytical_models(t_obs, C_obs):
     models = {
         # name: (function, fixed parameters, starts, lower, upper) - amplitude excluded
         "sauty_uniform": (sauty_uniform, {}, sauty_starts, [1, 1], [T, 1e4]),
-        "sauty_radial": (sauty_radial, {}, sauty_starts, [1, 1], [T, 1e4]),
         "bullivant_single_fracture": (
             bullivant_single_fracture,
             {},
