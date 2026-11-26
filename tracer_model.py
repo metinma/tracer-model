@@ -39,9 +39,12 @@ def main():
 
     all_fits = []
     for well in PRODUCERS:
-        t_obs, C_obs = tracer_data[well]
+        t_obs, C_raw = tracer_data[well]
+        C_bg = estimate_background(C_raw)
+        C_obs = np.clip(C_raw - C_bg, 0.0, None)
         fits = fit_analytical_models(t_obs, C_obs)
-        plot_fitted_curves(t_obs, C_obs, fits, well)
+        plot_fitted_curves(t_obs, C_obs, fits, well, C_bg)
+        print(f"  {well}: background removed = {C_bg:.3g} ppb")
         all_fits += [dict(fit, well=well) for fit in fits]
 
     print_fit_summary(all_fits)
@@ -79,6 +82,17 @@ def houseworth_fracture_matrix(t, t_a, beta, gamma, M):
 
     exponent = -beta / (4 * theta) - gamma * theta / 4
     return np.nan_to_num(M * np.sqrt(beta / np.pi) / 4 / theta**1.5 * np.exp(exponent))
+
+
+def estimate_background(C_obs):
+    """Background level of the measured data, outside the tracer plume.
+
+    Taken as the lower of the median of the first and last 10% of samples, so
+    that a record ending near its peak, or starting with residual tracer, does
+    not inflate it.
+    """
+    n = max(5, len(C_obs) // 10)
+    return min(np.median(C_obs[:n]), np.median(C_obs[-n:]))
 
 
 def robust_peak(t_obs, C_obs, window=5):
@@ -282,7 +296,7 @@ def plot_tracer_data(tracer_data):
     plt.close()
 
 
-def plot_fitted_curves(t_obs, C_obs, fits, well):
+def plot_fitted_curves(t_obs, C_obs, fits, well, C_bg):
     _, C_max = robust_peak(t_obs, C_obs)
 
     plt.figure(figsize=(10, 6))
@@ -292,7 +306,7 @@ def plot_fitted_curves(t_obs, C_obs, fits, well):
         color="black",
         s=15,
         alpha=0.7,
-        label="Measured Field Data",
+        label=f"Measured Field Data (background {C_bg:.3g} ppb removed)",
     )
 
     t_end = max(PLOT_T_END_DAYS, np.max(t_obs))
