@@ -1,4 +1,3 @@
-import csv
 import inspect
 from pathlib import Path
 
@@ -46,7 +45,6 @@ def main():
         all_fits += [dict(fit, well=well) for fit in fits]
 
     print_fit_summary(all_fits)
-    save_fit_summary(all_fits, "fit_summary.csv")
 
 
 def sauty_uniform(t, t_c, Pe, C_max):
@@ -228,36 +226,8 @@ def fit_analytical_models(t_obs, C_obs):
 
 
 def print_fit_summary(all_fits):
-    print(
-        "\nFit summary  (RMSE is time-weighted, in ppb; "
-        "* = parameter stopped at a bound, not estimated)"
-    )
     for fit in all_fits:
-        params = ", ".join(
-            f"{k}={v:.4g}{'*' if k in fit['at_bound'] else ''}"
-            for k, v in fit["params"].items()
-        )
-        print(
-            f"  {fit['well'].upper()}  {fit['model']:<28} "
-            f"RMSE={fit['rmse']:.3f}  {params}"
-        )
-
-
-def save_fit_summary(all_fits, path):
-    with open(path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["well", "model", "rmse", "parameters", "at_bound"])
-        for fit in all_fits:
-            params = "; ".join(f"{k}={v:.6g}" for k, v in fit["params"].items())
-            writer.writerow(
-                [
-                    fit["well"],
-                    fit["model"],
-                    f"{fit['rmse']:.6g}",
-                    params,
-                    "; ".join(fit["at_bound"]),
-                ]
-            )
+        print(f"{fit['well'].upper()}  {fit['model']:<28} RMSE={fit['rmse']:.3f}")
 
 
 def import_tracer_data(data_dir):
