@@ -93,7 +93,6 @@ def main():
 
 # Values held fixed from Table 2 for each model, as (value, marker).
 FIXED_VALUES = {
-    "Eq. 23": {"alpha_L": (TABLE_2["sauty"]["alpha_L"], "")},
     "Uniform porous - Sauty (1980)": {"alpha_L": (TABLE_2["sauty"]["alpha_L"], ""),
                                       "alpha_T": (TABLE_2["sauty"]["alpha_T"], "")},
     "Single fracture - Bullivant & Sul.(1989)": {
@@ -107,7 +106,6 @@ FIXED_VALUES = {
 }
 
 SHORT_NAMES = {
-    "Eq. 23": "Sauty 1-D (Eq. 23)",
     "Uniform porous - Sauty (1980)": "Sauty 2-D (Eq. 39-42)",
     "Single fracture - Bullivant & Sul.(1989)": "B&O single fracture",
     "Fracture-matrix - Bullivant & Sul. (1989)": "B&O fracture-matrix",
@@ -251,20 +249,6 @@ def sauty(t, t_c, P, y_R=0.0):
     return np.exp(log_shape(tR) - log_shape(tR_max))
 
 
-def sauty_1d(t, t_c, P):
-    """Sauty (1980) Eq. 22 with K' from Eq. 23 ("Eq. 23" in Figure 1).
-
-    1-D uniform flow, derivative of the step solution (flux concentration).
-    """
-    tR = np.maximum(t / t_c, 1e-12)
-    tR_max = np.sqrt(1.0 + 9.0 / P**2) - 3.0 / P     # Eq. 23
-
-    def log_shape(x):
-        return -1.5 * np.log(x) - P * (1.0 - x) ** 2 / (4.0 * x)
-
-    return np.exp(log_shape(tR) - log_shape(tR_max))
-
-
 # func: Bullivant's single fracture flow.
 def bullivant_single_fracture(t, t_m, w):
     """Bullivant & O'Sullivan (1989) Eq. 8.
@@ -355,10 +339,6 @@ def fit_models(btc, dz):
 
     # label: (function, parameter names, starting points, lower bounds, upper bounds)
     setups = {
-        "Eq. 23": (
-            lambda t, t_c, L: sauty_1d(t, t_c, L / alpha_L), ["t_c", "L"],
-            [[t0, L] for t0 in times for L in lengths],
-            [1.0, 10.0], [10.0 * t_end, 1e4]),
         "Uniform porous - Sauty (1980)": (
             lambda t, t_c, L: sauty(t, t_c, L / alpha_L), ["t_c", "L"],
             [[t0, L] for t0 in times for L in lengths],
@@ -462,7 +442,6 @@ def permeability_tensor(k, directions, e1, e2):
 
 
 # Draw graphs for time (days) vs C/Cmax for every well, in the style of Figure 1.
-# Eq. 23 is fitted and reported in the results table but not plotted.
 STYLES = {
     "Uniform porous - Sauty (1980)": dict(ls="--"),
     "Single fracture - Bullivant & Sul.(1989)": dict(ls="-."),
