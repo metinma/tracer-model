@@ -462,8 +462,8 @@ def permeability_tensor(k, directions, e1, e2):
 
 
 # Draw graphs for time (days) vs C/Cmax for every well, in the style of Figure 1.
+# Eq. 23 is fitted and reported in the results table but not plotted.
 STYLES = {
-    "Eq. 23": dict(ls="-"),
     "Uniform porous - Sauty (1980)": dict(ls="--"),
     "Single fracture - Bullivant & Sul.(1989)": dict(ls="-."),
     "Fracture-matrix - Bullivant & Sul. (1989)": dict(ls=":"),
@@ -476,12 +476,8 @@ def plot_fits(well, btc, fits):
     t_fine = np.linspace(0.0, 1000.0, 2001)
 
     fig, ax = plt.subplots(figsize=(7, 4.5))
-    names = list(fits)
-    # Same legend order as Figure 1: Eq. 23, Measurement, then the four models.
-    ax.plot(t_fine, fits[names[0]]["func"](t_fine, *fits[names[0]]["params"].values()),
-            color="k", lw=1, label=names[0], **STYLES[names[0]])
     ax.plot(t, y, "o", ms=4, mfc="none", color="k", label="Measurement")
-    for name in names[1:]:
+    for name in STYLES:
         fit = fits[name]
         ax.plot(t_fine, fit["func"](t_fine, *fit["params"].values()),
                 color="k", lw=1, label=name, **STYLES[name])
